@@ -84,6 +84,19 @@
     `).join('');
   };
 
+  // 首頁投資人卡片：依分類顯示後台最新一份文件（<span data-cms-latest="分類A,分類B">）
+  const renderHomeLatest = (docs) => {
+    document.querySelectorAll('[data-cms-latest]').forEach((el) => {
+      const cats = el.dataset.cmsLatest.split(',').map((c) => c.trim()).filter(Boolean);
+      const latest = docs
+        .filter((d) => cats.includes(d.category) && d.file_url)
+        .sort((x, y) => String(y.published_at || '').localeCompare(String(x.published_at || '')))[0];
+      el.innerHTML = latest
+        ? `<a href="${esc(latest.file_url)}" target="_blank" rel="noopener">最新：${esc(latest.title)} →</a>`
+        : '';
+    });
+  };
+
   const docLink = (d) => d.file_url ? `<a class="cms-doc-link" href="${esc(d.file_url)}" target="_blank" rel="noopener">查看文件 →</a>` : '';
   const docMeta = (d) => [d.year, d.quarter].filter(Boolean).join(' · ');
 
@@ -136,7 +149,10 @@
       if (page === 'financial') renderDocs('#cms-financial-docs', documents, ['財務資訊', '法說會']);
       if (page === 'sustainability') renderDocs('#cms-sustainability-docs', documents, ['永續發展']);
       if (page === 'stock') renderStock(company);
-      if (page === 'home') renderHomeBoard(board);
+      if (page === 'home') {
+        renderHomeBoard(board);
+        renderHomeLatest(documents);
+      }
 
       document.documentElement.dataset.cmsReady = 'true';
     } catch (err) {
