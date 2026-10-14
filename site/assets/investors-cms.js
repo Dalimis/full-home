@@ -91,9 +91,10 @@
       const latest = docs
         .filter((d) => cats.includes(d.category) && d.file_url)
         .sort((x, y) => String(y.published_at || '').localeCompare(String(x.published_at || '')))[0];
-      el.innerHTML = latest
-        ? `<a href="${esc(latest.file_url)}" target="_blank" rel="noopener">最新：${esc(latest.title)} →</a>`
-        : '';
+      // 後台沒有該分類文件時，保留 HTML 內原本的備援連結
+      if (latest) {
+        el.innerHTML = `<a href="${esc(latest.file_url)}" target="_blank" rel="noopener">最新：${esc(latest.title)} →</a>`;
+      }
     });
   };
 
