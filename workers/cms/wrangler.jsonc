@@ -32,15 +32,24 @@
   ],
 
   "r2_buckets": [
-    { "binding": "FILES", "bucket_name": "fullhome-files" }
+    { "binding": "FILES", "bucket_name": "fullhome-files" },
+    // 備份專用 bucket（需先在 Dashboard 建立）：d1/ 資料庫快照、files/ 檔案副本、status/ 最近一次結果
+    { "binding": "BACKUPS", "bucket_name": "fullhome-backups" }
   ],
+
+  // 每天 18:00 UTC（台灣 02:00）：備份 + 清理過期的聯絡表單紀錄
+  "triggers": {
+    "crons": ["0 18 * * *"]
+  },
 
   // 非機密設定（AUD 與 team domain 都會出現在公開的登入轉址網址中）
   "vars": {
     "ACCESS_TEAM_DOMAIN": "https://da-li.cloudflareaccess.com",
     "ACCESS_AUD": "daeb672686dea5daf2b819f477ccf8f8dee84281da44b4ceb9ff187eb0a29d7c",
     // 系統管理員：永遠擁有全部權限（含權限管理），不受後台設定影響，避免被鎖在外面
-    "SUPER_ADMINS": "dennis.chen@da-li.com.tw,mis@da-li.com.tw"
+    "SUPER_ADMINS": "dennis.chen@da-li.com.tw,mis@da-li.com.tw",
+    // 聯絡表單紀錄保存天數（個資），超過自動刪除
+    "CONTACT_RETENTION_DAYS": "365"
   },
 
   "observability": {

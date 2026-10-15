@@ -1,4 +1,9 @@
 export default {
+  // 每日排程（wrangler.jsonc triggers.crons）：備份 + 清理過期表單紀錄
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runMaintenance(env, "cron"));
+  },
+
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -157,6 +162,38 @@ export default {
           env,
           Number(docMatch[1])
         );
+      }
+
+      // ===== 聯絡表單紀錄 =====
+      if (path === "/api/admin/contacts" && request.method === "GET") {
+        return listContacts(url, env);
+      }
+
+      if (path === "/api/admin/contacts/export.csv" && request.method === "GET") {
+        return exportContactsCsv(url, env, me);
+      }
+
+      const contactMatch = path.match(/^\/api\/admin\/contacts\/(\d+)$/);
+
+      if (contactMatch && request.method === "PUT") {
+        return updateContact(request, env, me, Number(contactMatch[1]));
+      }
+
+      if (contactMatch && request.method === "DELETE") {
+        return deleteContact(env, me, Number(contactMatch[1]));
+      }
+
+      // ===== 系統備份 =====
+      if (path === "/api/admin/backups" && request.method === "GET") {
+        return listBackups(env);
+      }
+
+      if (path === "/api/admin/backups/run" && request.method === "POST") {
+        return json({ ok: true, result: await runMaintenance(env, me.email) });
+      }
+
+      if (path === "/api/admin/backups/download" && request.method === "GET") {
+        return downloadBackup(url, env);
       }
 
       // ===== 頁面內容 =====
@@ -1385,6 +1422,286 @@ function slug(value) {
 }
 
 
+// ===== 聯絡表單紀錄 =====
+// fullhome-contact 寫入，這裡負責後台查詢、處理狀態、匯出與清理。資料表定義需與 workers/contact 相同。
+
+const CONTACT_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS contact_submissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    name TEXT, phone TEXT, city TEXT, address TEXT,
+    age TEXT, owners TEXT, type TEXT, message TEXT,
+    status TEXT NOT NULL DEFAULT 'new',
+    mail_status TEXT NOT NULL DEFAULT 'pending',
+    mail_error TEXT,
+    note TEXT,
+    handled_by TEXT,
+    handled_at TEXT
+  )`;
+
+const CONTACT_STATUSES = ["new", "contacted", "closed", "spam"];
+
+let contactTableReady = false;
+
+async function ensureContactTable(env) {
+  if (contactTableReady) return;
+  await env.DB.prepare(CONTACT_TABLE_SQL).run();
+  contactTableReady = true;
+}
+
+function contactFilter(url) {
+  const where = [];
+  const binds = [];
+  const status = url.searchParams.get("status") || "";
+  const q = (url.searchParams.get("q") || "").trim().slice(0, 50);
+
+  if (CONTACT_STATUSES.includes(status)) {
+    where.push("status = ?");
+    binds.push(status);
+  }
+
+  if (q) {
+    where.push("(name LIKE ? OR phone LIKE ? OR address LIKE ? OR message LIKE ? OR note LIKE ?)");
+    const like = `%${q}%`;
+    binds.push(like, like, like, like, like);
+  }
+
+  return { where, binds };
+}
+
+async function listContacts(url, env) {
+  await ensureContactTable(env);
+  const { where, binds } = contactFilter(url);
+  const beforeId = Number(url.searchParams.get("before_id")) || 0;
+  if (beforeId > 0) {
+    where.push("id < ?");
+    binds.push(beforeId);
+  }
+
+  const sql = `SELECT * FROM contact_submissions
+    ${where.length ? "WHERE " + where.join(" AND ") : ""}
+    ORDER BY id DESC LIMIT 101`;
+  const rows = (await env.DB.prepare(sql).bind(...binds).all()).results || [];
+
+  const counts = (await env.DB.prepare(
+    "SELECT status, COUNT(*) AS n FROM contact_submissions GROUP BY status"
+  ).all()).results || [];
+
+  const failed = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM contact_submissions WHERE mail_status = 'failed'"
+  ).first();
+
+  return json({
+    ok: true,
+    items: rows.slice(0, 100),
+    has_more: rows.length > 100,
+    counts: Object.fromEntries(counts.map((c) => [c.status, c.n])),
+    mail_failed: failed ? failed.n : 0,
+    retention_days: retentionDays(env)
+  });
+}
+
+async function updateContact(request, env, me, id) {
+  await ensureContactTable(env);
+  const body = await request.json();
+  const status = CONTACT_STATUSES.includes(body.status) ? body.status : null;
+  if (!status) return json({ ok: false, message: "狀態不正確。" }, 400);
+
+  const result = await env.DB.prepare(`
+    UPDATE contact_submissions
+    SET status = ?, note = ?, handled_by = ?, handled_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).bind(status, clean(body.note, 1000), me.email, id).run();
+
+  if (!result.meta?.changes) return json({ ok: false, message: "找不到此筆資料。" }, 404);
+  return json({ ok: true, message: "已更新。" });
+}
+
+async function deleteContact(env, me, id) {
+  await ensureContactTable(env);
+  await env.DB.prepare("DELETE FROM contact_submissions WHERE id = ?").bind(id).run();
+  console.log("contact deleted", id, me.email);
+  return json({ ok: true, message: "已刪除。" });
+}
+
+function csvCell(v, asText) {
+  let s = String(v ?? "");
+  // 防 CSV 公式注入（Excel 會把 = + - @ 開頭當公式）
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  // 電話等數字欄位保留開頭的 0
+  if (asText && /^\d/.test(s)) s = "\t" + s;
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+const CONTACT_STATUS_LABELS = { new: "新進件", contacted: "已聯絡", closed: "已結案", spam: "垃圾訊息" };
+
+async function exportContactsCsv(url, env, me) {
+  await ensureContactTable(env);
+  const { where, binds } = contactFilter(url);
+  const sql = `SELECT * FROM contact_submissions
+    ${where.length ? "WHERE " + where.join(" AND ") : ""}
+    ORDER BY id DESC LIMIT 5000`;
+  const rows = (await env.DB.prepare(sql).bind(...binds).all()).results || [];
+
+  const header = ["編號", "送出時間(UTC)", "姓名", "電話", "縣市", "基地地址", "屋齡", "地主/住戶概況", "希望了解", "其他說明", "處理狀態", "備註", "處理人", "處理時間", "通知信"];
+  const lines = [header.map((h) => csvCell(h)).join(",")];
+
+  for (const r of rows) {
+    lines.push([
+      r.id, r.created_at, r.name, r.phone, r.city, r.address,
+      r.age, r.owners, r.type, r.message, CONTACT_STATUS_LABELS[r.status] || r.status,
+      r.note, r.handled_by, r.handled_at, r.mail_status === "sent" ? "已寄出" : r.mail_status === "failed" ? "寄送失敗" : "處理中"
+    ].map((v, i) => csvCell(v, i === 3)).join(","));
+  }
+
+  console.log("contacts exported", rows.length, me.email);
+
+  const date = new Date().toISOString().slice(0, 10);
+  return new Response("\uFEFF" + lines.join("\r\n"), {
+    headers: {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="contact-submissions-${date}.csv"`,
+      "Cache-Control": "no-store"
+    }
+  });
+}
+
+function retentionDays(env) {
+  const n = Number(env.CONTACT_RETENTION_DAYS);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 365;
+}
+
+
+// ===== 系統備份（每日排程 + 後台手動）=====
+// D1：每張表匯出成 JSON 快照，保留最近 30 份。
+// R2：fullhome-files 的檔案增量複製到備份 bucket 的 files/，來源刪除時備份不刪（防誤刪）。
+
+const BACKUP_KEEP = 30;
+const FILE_COPY_LIMIT = 200;
+
+async function runMaintenance(env, by) {
+  const result = { at: new Date().toISOString(), by, purged_contacts: 0, d1: null, files: null, errors: [] };
+
+  try {
+    await ensureContactTable(env);
+    const r = await env.DB.prepare(
+      "DELETE FROM contact_submissions WHERE created_at < datetime('now', ?)"
+    ).bind(`-${retentionDays(env)} days`).run();
+    result.purged_contacts = r.meta?.changes || 0;
+  } catch (e) {
+    result.errors.push("purge: " + e.message);
+  }
+
+  if (!env.BACKUPS) {
+    result.errors.push("BACKUPS bucket not bound");
+  } else {
+    try { result.d1 = await backupD1(env); } catch (e) { result.errors.push("d1: " + e.message); }
+    try { result.files = await backupFiles(env); } catch (e) { result.errors.push("files: " + e.message); }
+    await env.BACKUPS.put("status/last-run.json", JSON.stringify(result, null, 2), {
+      httpMetadata: { contentType: "application/json" }
+    });
+  }
+
+  console.log("maintenance", JSON.stringify(result));
+  return result;
+}
+
+async function backupD1(env) {
+  const tables = (await env.DB.prepare(
+    "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY name"
+  ).all()).results || [];
+
+  const snapshot = { database: "fullhome-cms-db", created_at: new Date().toISOString(), tables: {} };
+  let rowCount = 0;
+
+  for (const t of tables) {
+    const rows = (await env.DB.prepare(`SELECT * FROM "${t.name.replace(/"/g, '""')}"`).all()).results || [];
+    snapshot.tables[t.name] = { schema: t.sql, rows };
+    rowCount += rows.length;
+  }
+
+  // 例：20261015-020000-123（含毫秒，避免同一秒內重複執行時互相覆蓋）
+  const stamp = snapshot.created_at.replace(/[-:]/g, "").replace("T", "-").replace(".", "-").replace("Z", "");
+  const key = `d1/fullhome-cms-db-${stamp}.json`;
+  await env.BACKUPS.put(key, JSON.stringify(snapshot), { httpMetadata: { contentType: "application/json" } });
+
+  // 只保留最近 BACKUP_KEEP 份
+  const listed = await env.BACKUPS.list({ prefix: "d1/" });
+  const old = listed.objects.map((o) => o.key).sort().reverse().slice(BACKUP_KEEP);
+  if (old.length) await env.BACKUPS.delete(old);
+
+  return { key, tables: tables.length, rows: rowCount, removed_old: old.length };
+}
+
+async function backupFiles(env) {
+  let cursor;
+  let copied = 0, skipped = 0, total = 0;
+
+  do {
+    const page = await env.FILES.list({ cursor, limit: 500 });
+    for (const obj of page.objects) {
+      total++;
+      const dest = `files/${obj.key}`;
+      const existing = await env.BACKUPS.head(dest);
+      if (existing && existing.customMetadata?.sourceEtag === obj.etag) {
+        skipped++;
+        continue;
+      }
+      if (copied >= FILE_COPY_LIMIT) continue;
+
+      const src = await env.FILES.get(obj.key);
+      if (!src) continue;
+      await env.BACKUPS.put(dest, await src.arrayBuffer(), {
+        httpMetadata: src.httpMetadata,
+        customMetadata: { ...(src.customMetadata || {}), sourceEtag: obj.etag }
+      });
+      copied++;
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  return { total, copied, skipped, pending: Math.max(0, total - copied - skipped) };
+}
+
+async function listBackups(env) {
+  if (!env.BACKUPS) return json({ ok: false, message: "尚未設定備份空間（BACKUPS）。" }, 500);
+
+  const d1 = await env.BACKUPS.list({ prefix: "d1/" });
+  let fileCount = 0, fileBytes = 0, cursor;
+  do {
+    const page = await env.BACKUPS.list({ prefix: "files/", cursor, limit: 1000 });
+    fileCount += page.objects.length;
+    fileBytes += page.objects.reduce((n, o) => n + o.size, 0);
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  const last = await env.BACKUPS.get("status/last-run.json");
+
+  return json({
+    ok: true,
+    snapshots: d1.objects
+      .map((o) => ({ key: o.key, size: o.size, uploaded: o.uploaded }))
+      .sort((a, b) => (a.key < b.key ? 1 : -1)),
+    files: { count: fileCount, bytes: fileBytes },
+    last_run: last ? await last.json() : null
+  });
+}
+
+async function downloadBackup(url, env) {
+  const key = url.searchParams.get("key") || "";
+  if (!/^d1\/fullhome-cms-db-[0-9-]+\.json$/.test(key)) return json({ ok: false, message: "檔名不正確。" }, 400);
+  const obj = await env.BACKUPS.get(key);
+  if (!obj) return json({ ok: false, message: "找不到備份。" }, 404);
+  return new Response(obj.body, {
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${key.slice(3)}"`,
+      "Cache-Control": "no-store"
+    }
+  });
+}
+
+
 // ===== 頁面內容（首頁每個區塊的文字與圖片）=====
 // HTML 裡用 data-edit / data-edit-img / data-edit-bg 標記可編輯區塊；
 // 這裡只存「有改過的」值，沒改過的維持 HTML 原本內容。
@@ -1577,10 +1894,11 @@ async function renderHomepage(request, env) {
 // 登入（身分驗證）由 Cloudflare Access 負責；這裡決定「登入後能改哪些區塊」。
 // SUPER_ADMINS（wrangler.jsonc）永遠擁有全部權限，不會被鎖在外面。
 
-const PERMISSIONS = ["pages", "company", "board", "documents", "faqs", "users"];
+const PERMISSIONS = ["pages", "contacts", "company", "board", "documents", "faqs", "users"];
 
 const PERMISSION_LABELS = {
   pages: "頁面內容",
+  contacts: "聯絡表單",
   company: "公司資料",
   board: "董事會管理",
   documents: "文件管理",
@@ -1611,6 +1929,8 @@ function parsePermissions(value) {
 
 function requiredPermission(path) {
   if (path.startsWith("/api/admin/content")) return "pages";
+  if (path.startsWith("/api/admin/contacts")) return "contacts";
+  if (path.startsWith("/api/admin/backups")) return "users";
   if (path.startsWith("/api/admin/company")) return "company";
   if (path.startsWith("/api/admin/board")) return "board";
   if (path.startsWith("/api/admin/documents")) return "documents";
@@ -2419,6 +2739,12 @@ th{
     </button>
 
     <button
+      data-target="contacts"
+    >
+      聯絡表單
+    </button>
+
+    <button
       data-target="company"
     >
       公司資料
@@ -2446,6 +2772,12 @@ th{
       data-target="users"
     >
       權限管理
+    </button>
+
+    <button
+      data-target="backups"
+    >
+      系統備份
     </button>
 
   </div>
@@ -3421,6 +3753,92 @@ th{
         title="首頁編輯預覽"
         style="width:100%;height:78vh;border:0;display:block;background:#fff"
       ></iframe>
+    </div>
+
+  </section>
+
+  <section
+    id="contacts"
+    class="section"
+  >
+
+    <div class="panel">
+      <h2>聯絡表單紀錄</h2>
+
+      <div id="contactSummary" class="muted" style="margin:-8px 0 14px"></div>
+
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        <select id="contactStatus" style="width:auto">
+          <option value="">全部狀態</option>
+          <option value="new">新進件</option>
+          <option value="contacted">已聯絡</option>
+          <option value="closed">已結案</option>
+          <option value="spam">垃圾訊息</option>
+        </select>
+        <input id="contactQ" placeholder="搜尋姓名、電話、地址、內容、備註" style="flex:1;min-width:220px">
+        <button class="btn primary" type="button" id="contactSearch">搜尋</button>
+        <a class="btn ghost" id="contactExport" href="/api/admin/contacts/export.csv" style="text-decoration:none">匯出 CSV（Excel）</a>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:150px">送出時間</th>
+              <th>聯絡人</th>
+              <th>基地</th>
+              <th style="width:110px">希望了解</th>
+              <th style="width:90px">狀態</th>
+              <th style="width:90px">通知信</th>
+              <th style="width:80px"></th>
+            </tr>
+          </thead>
+          <tbody id="contactRows"></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button class="btn ghost" type="button" id="contactMore" style="display:none">載入更多</button>
+      </div>
+    </div>
+
+  </section>
+
+
+  <section
+    id="backups"
+    class="section"
+  >
+
+    <div class="panel">
+      <h2>系統備份</h2>
+      <p class="muted" style="margin-top:-8px">
+        每天凌晨 2 點自動備份：資料庫完整快照（保留最近 30 份）、上傳檔案增量複製到獨立的備份空間。
+        來源檔案被刪除時，備份不會跟著刪除。
+      </p>
+      <div id="backupSummary" style="margin:12px 0"></div>
+      <div class="actions">
+        <button class="btn primary" type="button" id="backupRun">立即備份</button>
+        <button class="btn ghost" type="button" id="backupRefresh">重新整理</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>資料庫快照</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>檔案</th>
+              <th style="width:120px">大小</th>
+              <th style="width:180px">建立時間</th>
+              <th style="width:90px"></th>
+            </tr>
+          </thead>
+          <tbody id="backupRows"></tbody>
+        </table>
+      </div>
     </div>
 
   </section>
@@ -4469,6 +4887,8 @@ async function removeDoc(
 
 var SECTION_PERMISSION = {
   pages: "pages",
+  contacts: "contacts",
+  backups: "users",
   company: "company",
   board: "board",
   documents: "documents",
@@ -4863,6 +5283,228 @@ window.addEventListener("beforeunload", function(e) {
 document.querySelector('.nav button[data-target="pages"]').addEventListener("click", function() {
   if (!pageEditor.loaded) loadPageFrame();
 });
+
+
+// ===== 聯絡表單 =====
+
+var contactState = { items: [], loadedOnce: false };
+
+var CONTACT_LABEL = { "new": "新進件", "contacted": "已聯絡", "closed": "已結案", "spam": "垃圾訊息" };
+var MAIL_LABEL = { "sent": "已寄出", "failed": "寄送失敗", "pending": "處理中" };
+
+function twTime(v) {
+  if (!v) return "";
+  var d = new Date(String(v).replace(" ", "T") + "Z");
+  if (isNaN(d.getTime())) return v;
+  return d.toLocaleString("zh-TW", { timeZone: "Asia/Taipei", hour12: false });
+}
+
+function contactQuery() {
+  var p = new URLSearchParams();
+  var st = document.getElementById("contactStatus").value;
+  var q = document.getElementById("contactQ").value.trim();
+  if (st) p.set("status", st);
+  if (q) p.set("q", q);
+  return p;
+}
+
+async function loadContacts(append) {
+  var p = contactQuery();
+  if (append && contactState.items.length) {
+    p.set("before_id", contactState.items[contactState.items.length - 1].id);
+  }
+
+  try {
+    var data = await api("/api/admin/contacts?" + p.toString());
+    contactState.items = append ? contactState.items.concat(data.items) : data.items;
+    contactState.loadedOnce = true;
+
+    var c = data.counts || {};
+    document.getElementById("contactSummary").innerHTML =
+      "新進件 <strong>" + (c["new"] || 0) + "</strong>｜已聯絡 " + (c.contacted || 0) +
+      "｜已結案 " + (c.closed || 0) + "｜垃圾訊息 " + (c.spam || 0) +
+      (data.mail_failed ? '｜<span style="color:#a22;font-weight:800">通知信寄送失敗 ' + data.mail_failed + " 筆</span>" : "") +
+      "｜資料保存 " + data.retention_days + " 天後自動刪除";
+
+    document.getElementById("contactExport").href = "/api/admin/contacts/export.csv?" + contactQuery().toString();
+    document.getElementById("contactMore").style.display = data.has_more ? "" : "none";
+    renderContacts();
+  } catch (err) {
+    flash(err.message, false);
+  }
+}
+
+function renderContacts() {
+  var tbody = document.getElementById("contactRows");
+  tbody.innerHTML = "";
+
+  if (!contactState.items.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="muted">沒有符合的資料。</td></tr>';
+    return;
+  }
+
+  contactState.items.forEach(function(r) {
+    var tr = document.createElement("tr");
+    tr.innerHTML =
+      "<td>" + esc(twTime(r.created_at)) + "</td>" +
+      "<td><strong>" + esc(r.name) + '</strong><div class="muted">' + esc(r.phone) + "</div></td>" +
+      "<td>" + esc(r.address) + "</td>" +
+      "<td>" + esc(r.type) + "</td>" +
+      '<td><span class="badge">' + esc(CONTACT_LABEL[r.status] || r.status) + "</span></td>" +
+      "<td" + (r.mail_status === "failed" ? ' style="color:#a22;font-weight:800"' : "") + ">" + esc(MAIL_LABEL[r.mail_status] || r.mail_status) + "</td>" +
+      '<td><button class="btn ghost" type="button" data-open-contact="' + r.id + '">查看</button></td>';
+    tbody.appendChild(tr);
+  });
+
+  tbody.querySelectorAll("[data-open-contact]").forEach(function(btn) {
+    btn.onclick = function() { toggleContact(btn, Number(btn.dataset.openContact)); };
+  });
+}
+
+function toggleContact(btn, id) {
+  var row = btn.closest("tr");
+  var next = row.nextElementSibling;
+  if (next && next.dataset.detailFor === String(id)) {
+    next.remove();
+    return;
+  }
+
+  var r = contactState.items.find(function(x) { return x.id === id; });
+  if (!r) return;
+
+  var d = document.createElement("tr");
+  d.dataset.detailFor = String(id);
+
+  var opts = Object.keys(CONTACT_LABEL).map(function(k) {
+    return '<option value="' + k + '"' + (r.status === k ? " selected" : "") + ">" + CONTACT_LABEL[k] + "</option>";
+  }).join("");
+
+  d.innerHTML =
+    '<td colspan="7" style="background:#f8f8fc">' +
+      '<div class="grid2">' +
+        "<div><label>縣市 / 地址</label><div>" + esc(r.city) + " " + esc(r.address) + "</div></div>" +
+        "<div><label>屋齡</label><div>" + esc(r.age || "未填寫") + "</div></div>" +
+        "<div><label>地主 / 住戶概況</label><div>" + esc(r.owners || "未填寫") + "</div></div>" +
+        '<div><label>電話</label><div><a href="tel:' + escAttr(r.phone) + '">' + esc(r.phone) + "</a></div></div>" +
+        '<div class="field full"><label>其他說明</label><div style="white-space:pre-line">' + esc(r.message || "未填寫") + "</div></div>" +
+        (r.mail_error ? '<div class="field full"><label>通知信錯誤</label><div class="muted">' + esc(r.mail_error) + "</div></div>" : "") +
+        '<div class="field"><label>處理狀態</label><select data-c-status>' + opts + "</select></div>" +
+        '<div class="field"><label>最後處理</label><div class="muted">' + esc(r.handled_by || "—") + " " + esc(twTime(r.handled_at)) + "</div></div>" +
+        '<div class="field full"><label>備註</label><textarea data-c-note maxlength="1000">' + esc(r.note || "") + "</textarea></div>" +
+      "</div>" +
+      '<div class="actions">' +
+        '<button class="btn primary" type="button" data-c-save>儲存</button>' +
+        '<button class="btn danger" type="button" data-c-delete>刪除此筆</button>' +
+      "</div>" +
+    "</td>";
+
+  row.after(d);
+
+  d.querySelector("[data-c-save]").onclick = async function() {
+    try {
+      await api("/api/admin/contacts/" + id, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          status: d.querySelector("[data-c-status]").value,
+          note: d.querySelector("[data-c-note]").value
+        })
+      });
+      flash("已更新。");
+      loadContacts(false);
+    } catch (err) {
+      flash(err.message, false);
+    }
+  };
+
+  d.querySelector("[data-c-delete]").onclick = async function() {
+    if (!confirm("確定刪除這筆聯絡資料？刪除後無法復原（只能從備份找回）。")) return;
+    try {
+      await api("/api/admin/contacts/" + id, { method: "DELETE" });
+      flash("已刪除。");
+      loadContacts(false);
+    } catch (err) {
+      flash(err.message, false);
+    }
+  };
+}
+
+document.getElementById("contactSearch").addEventListener("click", function() { loadContacts(false); });
+document.getElementById("contactStatus").addEventListener("change", function() { loadContacts(false); });
+document.getElementById("contactQ").addEventListener("keydown", function(e) {
+  if (e.key === "Enter") loadContacts(false);
+});
+document.getElementById("contactMore").addEventListener("click", function() { loadContacts(true); });
+document.querySelector('.nav button[data-target="contacts"]').addEventListener("click", function() {
+  loadContacts(false);
+});
+
+
+// ===== 系統備份 =====
+
+function fmtBytes(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1048576).toFixed(1) + " MB";
+}
+
+async function loadBackups() {
+  try {
+    var data = await api("/api/admin/backups");
+    var last = data.last_run;
+
+    var html = "<div>備份檔案：" + data.files.count + " 個，共 " + fmtBytes(data.files.bytes) + "</div>";
+    if (last) {
+      html +=
+        "<div>上次執行：" + esc(new Date(last.at).toLocaleString("zh-TW", { timeZone: "Asia/Taipei", hour12: false })) +
+        "（" + esc(last.by === "cron" ? "自動排程" : last.by) + "）</div>" +
+        (last.d1 ? "<div>資料庫：" + last.d1.tables + " 張表、" + last.d1.rows + " 筆資料</div>" : "") +
+        (last.files ? "<div>檔案：本次複製 " + last.files.copied + "、已存在 " + last.files.skipped +
+          (last.files.pending ? "、待下次複製 " + last.files.pending : "") + "</div>" : "") +
+        "<div>清理過期表單紀錄：" + last.purged_contacts + " 筆</div>" +
+        (last.errors && last.errors.length
+          ? '<div style="color:#a22;font-weight:800">錯誤：' + esc(last.errors.join("；")) + "</div>"
+          : '<div style="color:#185b2a;font-weight:800">✓ 最近一次備份成功</div>');
+    } else {
+      html += '<div class="muted">尚未執行過備份。</div>';
+    }
+    document.getElementById("backupSummary").innerHTML = html;
+
+    var tbody = document.getElementById("backupRows");
+    tbody.innerHTML = data.snapshots.length ? "" : '<tr><td colspan="4" class="muted">尚無快照。</td></tr>';
+    data.snapshots.forEach(function(s) {
+      var tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td>" + esc(s.key.slice(3)) + "</td>" +
+        "<td>" + fmtBytes(s.size) + "</td>" +
+        "<td>" + esc(new Date(s.uploaded).toLocaleString("zh-TW", { timeZone: "Asia/Taipei", hour12: false })) + "</td>" +
+        '<td><a class="btn ghost" style="text-decoration:none" href="/api/admin/backups/download?key=' + encodeURIComponent(s.key) + '">下載</a></td>';
+      tbody.appendChild(tr);
+    });
+  } catch (err) {
+    flash(err.message, false);
+  }
+}
+
+document.getElementById("backupRun").addEventListener("click", async function() {
+  var btn = this;
+  btn.disabled = true;
+  btn.textContent = "備份中…";
+  try {
+    var data = await api("/api/admin/backups/run", { method: "POST" });
+    var r = data.result;
+    flash(r.errors.length ? "備份完成，但有錯誤：" + r.errors.join("；") : "備份完成。", !r.errors.length);
+    await loadBackups();
+  } catch (err) {
+    flash(err.message, false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "立即備份";
+  }
+});
+
+document.getElementById("backupRefresh").addEventListener("click", loadBackups);
+document.querySelector('.nav button[data-target="backups"]').addEventListener("click", loadBackups);
 
 
 // ===== 常見問題 =====

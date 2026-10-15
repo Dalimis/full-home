@@ -23,6 +23,15 @@
     "MAIL_TO": "mis@da-li.com.tw,ira.peng@full-home.com.tw,kevin.hsieh@full-home.com.tw"
   },
 
+  // 表單提交紀錄（與 fullhome-cms 共用同一個資料庫，後台「聯絡表單」讀取）
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fullhome-cms-db",
+      "database_id": "afc512c2-803f-4f8c-9701-d9d76b96f73a"
+    }
+  ],
+
   "observability": {
     "enabled": true
   }

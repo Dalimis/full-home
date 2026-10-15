@@ -1,5 +1,7 @@
 export default {
   async fetch(request, env) {
+    let submissionId = null;
+
     const url = new URL(request.url);
 
     if (url.pathname !== "/api/contact") {
@@ -136,6 +138,13 @@ export default {
         );
       }
 
+      /*
+       * 先把提交內容存進 D1，寄信失敗時資料也不會遺失
+       */
+      submissionId = await saveSubmission(env, {
+        name, phone, city, address, age, owners, type, message
+      });
+
       if (
         !env.TENANT_ID ||
         !env.CLIENT_ID ||
@@ -146,14 +155,7 @@ export default {
           "Missing Worker environment variables."
         );
 
-        return json(
-          {
-            ok: false,
-            message:
-              "系統寄信設定尚未完成。"
-          },
-          500
-        );
+        return mailFailed(env, submissionId, "missing mail config", "系統寄信設定尚未完成。", 500);
       }
 
       /*
@@ -201,14 +203,7 @@ export default {
           tokenData
         );
 
-        return json(
-          {
-            ok: false,
-            message:
-              "郵件服務驗證失敗。"
-          },
-          502
-        );
+        return mailFailed(env, submissionId, `token ${tokenResponse.status}`, "郵件服務驗證失敗。", 502);
       }
 
       /*
@@ -1122,15 +1117,10 @@ full-home.com.tw
           graphError
         );
 
-        return json(
-          {
-            ok: false,
-            message:
-              "郵件寄送失敗，請稍後再試。"
-          },
-          502
-        );
+        return mailFailed(env, submissionId, `graph ${graphResponse.status}: ${graphError}`, "郵件寄送失敗，請稍後再試。", 502);
       }
+
+      await markMail(env, submissionId, "sent", null);
 
       return json({
         ok: true,
@@ -1144,6 +1134,10 @@ full-home.com.tw
         error
       );
 
+      if (submissionId) {
+        return mailFailed(env, submissionId, String(error && error.message || error), "", 500);
+      }
+
       return json(
         {
           ok: false,
@@ -1155,6 +1149,64 @@ full-home.com.tw
     }
   }
 };
+
+
+/*
+ * ===== 表單提交紀錄（D1：contact_submissions）=====
+ * 資料表定義需與 workers/cms 相同。
+ */
+const CONTACT_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS contact_submissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    name TEXT, phone TEXT, city TEXT, address TEXT,
+    age TEXT, owners TEXT, type TEXT, message TEXT,
+    status TEXT NOT NULL DEFAULT 'new',
+    mail_status TEXT NOT NULL DEFAULT 'pending',
+    mail_error TEXT,
+    note TEXT,
+    handled_by TEXT,
+    handled_at TEXT
+  )`;
+
+async function saveSubmission(env, f) {
+  if (!env.DB) return null;
+
+  try {
+    await env.DB.prepare(CONTACT_TABLE_SQL).run();
+    const r = await env.DB.prepare(`
+      INSERT INTO contact_submissions (name, phone, city, address, age, owners, type, message)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(f.name, f.phone, f.city, f.address, f.age, f.owners, f.type, f.message).run();
+    return r.meta?.last_row_id ?? null;
+  } catch (error) {
+    console.error("save submission failed:", error);
+    return null;
+  }
+}
+
+async function markMail(env, id, status, error) {
+  if (!env.DB || !id) return;
+  try {
+    await env.DB.prepare(
+      "UPDATE contact_submissions SET mail_status = ?, mail_error = ? WHERE id = ?"
+    ).bind(status, error ? String(error).slice(0, 500) : null, id).run();
+  } catch (e) {
+    console.error("mark mail failed:", e);
+  }
+}
+
+// 寄信失敗：資料已存進資料庫就回報成功（後台會標示寄信失敗）；沒存到才回錯誤
+async function mailFailed(env, id, reason, message, status) {
+  console.error("mail failed:", id, reason);
+  await markMail(env, id, "failed", reason);
+
+  if (id) {
+    return json({ ok: true, message: "資料已送出。" });
+  }
+
+  return json({ ok: false, message: message || "系統暫時無法處理，請稍後再試。" }, status);
+}
 
 
 /*
