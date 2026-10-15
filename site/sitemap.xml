@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 備援用：正常情況由 fullhome-cms Worker 依後台資料動態產生（含 lastmod） -->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://www.full-home.com.tw/</loc></url>
+  <url><loc>https://www.full-home.com.tw/investors/</loc></url>
+  <url><loc>https://www.full-home.com.tw/investors/company.html</loc></url>
+  <url><loc>https://www.full-home.com.tw/investors/governance.html</loc></url>
+  <url><loc>https://www.full-home.com.tw/investors/shareholders.html</loc></url>
+  <url><loc>https://www.full-home.com.tw/investors/financial.html</loc></url>
+  <url><loc>https://www.full-home.com.tw/investors/sustainability.html</loc></url>
+  <url><loc>https://www.full-home.com.tw/investors/stock.html</loc></url>
+  <url><loc>https://www.full-home.com.tw/investors/contact.html</loc></url>
+</urlset>

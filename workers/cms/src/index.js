@@ -101,6 +101,18 @@ export default {
         return renderHomepage(request, env);
       }
 
+      // 搜尋引擎：sitemap 依後台資料的最後更新時間產生；Worker 失敗時由 Pages 的靜態檔接手
+      if (path === "/sitemap.xml" && request.method === "GET") {
+        ctx?.passThroughOnException?.();
+        return renderSitemap(env);
+      }
+
+      if (path === "/robots.txt" && request.method === "GET") {
+        return new Response(ROBOTS_TXT, {
+          headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" }
+        });
+      }
+
       if (path.startsWith("/media/") && request.method === "GET") {
         return serveMedia(path, env);
       }
@@ -2332,6 +2344,84 @@ function seoValue(content, field) {
     }
     default: return null;
   }
+}
+
+const ROBOTS_TXT = [
+  "User-agent: *",
+  "Allow: /",
+  "Disallow: /admin",
+  "Disallow: /api/",
+  "Disallow: /*?cms-edit=",
+  "",
+  "Sitemap: https://www.full-home.com.tw/sitemap.xml",
+  ""
+].join("\n");
+
+// 每一頁的最後更新時間 = 影響該頁內容的資料表中最新的 updated_at
+const SITEMAP_PAGES = [
+  { loc: "/", sources: ["content", "faqs", "board", "docs:*"] },
+  { loc: "/investors/", sources: ["company", "board", "docs:*"] },
+  { loc: "/investors/company.html", sources: ["company"] },
+  { loc: "/investors/governance.html", sources: ["board", "docs:公司治理"] },
+  { loc: "/investors/shareholders.html", sources: ["docs:股東會"] },
+  { loc: "/investors/financial.html", sources: ["docs:財務資訊", "docs:法說會"] },
+  { loc: "/investors/sustainability.html", sources: ["docs:永續發展"] },
+  { loc: "/investors/stock.html", sources: ["company"] },
+  { loc: "/investors/contact.html", sources: ["company"] }
+];
+
+async function renderSitemap(env) {
+  const one = async (sql, ...args) => {
+    try {
+      const r = await env.DB.prepare(sql).bind(...args).first();
+      return r && r.t ? String(r.t) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const latest = {
+    content: await one("SELECT MAX(updated_at) AS t FROM site_content"),
+    faqs: await one("SELECT MAX(updated_at) AS t FROM faqs"),
+    board: await one("SELECT MAX(updated_at) AS t FROM board_members"),
+    company: await one("SELECT MAX(updated_at) AS t FROM company_profile")
+  };
+  const docRows = await (async () => {
+    try {
+      return (await env.DB.prepare(
+        "SELECT category, MAX(COALESCE(updated_at, published_at)) AS t FROM documents WHERE is_public = 1 GROUP BY category"
+      ).all()).results || [];
+    } catch {
+      return [];
+    }
+  })();
+  const docs = new Map(docRows.map((r) => [r.category, r.t]));
+
+  const toW3C = (t) => {
+    // D1 的 CURRENT_TIMESTAMP 為 UTC「YYYY-MM-DD HH:MM:SS」
+    const d = new Date(String(t).replace(" ", "T") + (String(t).includes("Z") ? "" : "Z"));
+    // 以台灣日期表示
+    return isNaN(d) ? null : new Date(d.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+  };
+
+  const urls = SITEMAP_PAGES.map((p) => {
+    const times = [];
+    for (const src of p.sources) {
+      if (src === "docs:*") times.push(...docs.values());
+      else if (src.startsWith("docs:")) times.push(docs.get(src.slice(5)));
+      else times.push(latest[src]);
+    }
+    const last = times.filter(Boolean).map(toW3C).filter(Boolean).sort().pop();
+    return "  <url><loc>" + SITE_ORIGIN + p.loc + "</loc>" + (last ? "<lastmod>" + last + "</lastmod>" : "") + "</url>";
+  });
+
+  const xml = '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
+    urls.join("\n") + "\n</urlset>\n";
+
+  return new Response(xml, {
+    headers: { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "public, max-age=3600" }
+  });
 }
 
 async function renderHomepage(request, env) {

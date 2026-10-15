@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /api/
+Disallow: /*?cms-edit=
+
+Sitemap: https://www.full-home.com.tw/sitemap.xml
