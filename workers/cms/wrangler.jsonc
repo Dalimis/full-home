@@ -1,0 +1,42 @@
+{
+  // fullhome-cms：投資人專區 CMS（後台 /admin/、admin API、公開 API、檔案下載）
+  // 注意：用 wrangler deploy 部署時，這份設定會「覆蓋」Dashboard 上的路由、變數與繫結。
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "fullhome-cms",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+
+  // 只走自訂網域路由；workers.dev 與預覽網址會繞過 Access，必須關閉
+  "workers_dev": false,
+  "preview_urls": false,
+
+  "routes": [
+    { "pattern": "www.full-home.com.tw/admin*", "zone_name": "full-home.com.tw" },
+    { "pattern": "www.full-home.com.tw/api/admin*", "zone_name": "full-home.com.tw" },
+    { "pattern": "www.full-home.com.tw/api/public/investors*", "zone_name": "full-home.com.tw" },
+    { "pattern": "www.full-home.com.tw/files/*", "zone_name": "full-home.com.tw" }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fullhome-cms-db",
+      // TODO：執行 `npx wrangler d1 list` 取得後填入
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+    }
+  ],
+
+  "r2_buckets": [
+    { "binding": "FILES", "bucket_name": "fullhome-files" }
+  ],
+
+  // 非機密設定（AUD 與 team domain 都會出現在公開的登入轉址網址中）
+  "vars": {
+    "ACCESS_TEAM_DOMAIN": "https://da-li.cloudflareaccess.com",
+    "ACCESS_AUD": "daeb672686dea5daf2b819f477ccf8f8dee84281da44b4ceb9ff187eb0a29d7c"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}

@@ -19,6 +19,30 @@ export default {
         );
       }
     }
+    // ===== 第二層防護：Worker 自行驗證 Cloudflare Access JWT =====
+    // Access 設定若漏設路徑、或被誤刪，後台與 admin API 仍會被擋下。
+    const isAdminArea =
+      path === "/admin/" || path.startsWith("/api/admin/");
+
+    if (isAdminArea) {
+      const auth = await verifyAccess(request, env);
+      if (!auth.ok) {
+        console.warn("Access JWT rejected:", auth.reason, path);
+        return path.startsWith("/api/")
+          ? json({ ok: false, message: "未授權，請重新登入。" }, 401)
+          : new Response("Unauthorized", { status: 401 });
+      }
+
+      // 寫入類請求必須來自本站頁面（防 CSRF）
+      if (path.startsWith("/api/admin/") && request.method !== "GET") {
+        const origin = request.headers.get("Origin");
+        if (origin !== "https://www.full-home.com.tw") {
+          return json({ ok: false, message: "來源不允許。" }, 403);
+        }
+        console.log("admin write", request.method, path, auth.email);
+      }
+    }
+
     try {
       if (path === "/admin" || path === "/admin/") {
         return htmlResponse(adminHtml());
@@ -760,6 +784,10 @@ async function uploadDocument(request, env) {
     );
   }
 
+  // 依副檔名決定 Content-Type，不信任瀏覽器送來的 file.type
+  // （避免把 HTML 偽裝成 PDF 上傳後，在官網網域被當成網頁執行）
+  const mimeType = MIME_BY_EXT[ext] || "application/octet-stream";
+
   const maxBytes =
     25 * 1024 * 1024;
 
@@ -789,9 +817,7 @@ async function uploadDocument(request, env) {
     file.stream(),
     {
       httpMetadata: {
-        contentType:
-          file.type ||
-          "application/octet-stream"
+        contentType: mimeType
       },
 
       customMetadata: {
@@ -846,8 +872,7 @@ async function uploadDocument(request, env) {
         originalName,
         key,
         file.size,
-        file.type ||
-          "application/octet-stream",
+        mimeType,
 
         sort_order,
         is_public
@@ -1119,6 +1144,11 @@ async function servePublicFile(
     "public, max-age=3600"
   );
 
+  headers.set(
+    "X-Content-Type-Options",
+    "nosniff"
+  );
+
 
   headers.set(
     "Content-Disposition",
@@ -1241,6 +1271,120 @@ function slug(value) {
       0,
       80
     );
+}
+
+
+const MIME_BY_EXT = {
+  pdf: "application/pdf",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp"
+};
+
+
+// ===== Cloudflare Access JWT 驗證 =====
+// env.ACCESS_TEAM_DOMAIN 例：https://da-li.cloudflareaccess.com
+// env.ACCESS_AUD        ：Access 應用程式的 Application Audience (AUD) Tag
+
+let accessKeysCache = { keys: null, fetchedAt: 0 };
+
+async function getAccessKeys(teamDomain) {
+  const now = Date.now();
+  if (accessKeysCache.keys && now - accessKeysCache.fetchedAt < 10 * 60 * 1000) {
+    return accessKeysCache.keys;
+  }
+  const res = await fetch(`${teamDomain}/cdn-cgi/access/certs`);
+  if (!res.ok) throw new Error(`certs ${res.status}`);
+  const { keys } = await res.json();
+  accessKeysCache = { keys: keys || [], fetchedAt: now };
+  return accessKeysCache.keys;
+}
+
+function b64urlToBytes(str) {
+  const b64 = str.replace(/-/g, "+").replace(/_/g, "/")
+    .padEnd(Math.ceil(str.length / 4) * 4, "=");
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function cookieValue(request, name) {
+  const cookie = request.headers.get("Cookie") || "";
+  const m = cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
+  return m ? m[1] : null;
+}
+
+async function verifyAccess(request, env) {
+  const teamDomain = env.ACCESS_TEAM_DOMAIN;
+  const aud = env.ACCESS_AUD;
+  if (!teamDomain || !aud) return { ok: false, reason: "missing config" };
+
+  const token =
+    request.headers.get("Cf-Access-Jwt-Assertion") ||
+    cookieValue(request, "CF_Authorization");
+  if (!token) return { ok: false, reason: "no token" };
+
+  const parts = token.split(".");
+  if (parts.length !== 3) return { ok: false, reason: "malformed" };
+
+  let header, payload;
+  try {
+    header = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[0])));
+    payload = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[1])));
+  } catch {
+    return { ok: false, reason: "decode" };
+  }
+
+  if (header.alg !== "RS256") return { ok: false, reason: "alg" };
+
+  const now = Math.floor(Date.now() / 1000);
+  if (typeof payload.exp !== "number" || payload.exp < now - 30) {
+    return { ok: false, reason: "expired" };
+  }
+  if (payload.iss !== teamDomain) return { ok: false, reason: "iss" };
+
+  const auds = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+  if (!auds.includes(aud)) return { ok: false, reason: "aud" };
+
+  let keys;
+  try {
+    keys = await getAccessKeys(teamDomain);
+  } catch (e) {
+    return { ok: false, reason: "certs fetch failed" };
+  }
+
+  const jwk = keys.find((k) => k.kid === header.kid);
+  if (!jwk) {
+    accessKeysCache.fetchedAt = 0; // 金鑰輪替時下次重新抓
+    return { ok: false, reason: "kid" };
+  }
+
+  const key = await crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+
+  const valid = await crypto.subtle.verify(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    b64urlToBytes(parts[2]),
+    new TextEncoder().encode(`${parts[0]}.${parts[1]}`)
+  );
+
+  if (!valid) return { ok: false, reason: "signature" };
+
+  return { ok: true, email: payload.email || "" };
 }
 
 
