@@ -1543,20 +1543,20 @@ async function exportContactsCsv(url, env, me) {
     ORDER BY id DESC LIMIT 5000`;
   const rows = (await env.DB.prepare(sql).bind(...binds).all()).results || [];
 
-  const header = ["編號", "送出時間(UTC)", "姓名", "電話", "縣市", "基地地址", "屋齡", "地主/住戶概況", "希望了解", "其他說明", "處理狀態", "備註", "處理人", "處理時間", "通知信"];
+  const header = ["編號", "送出時間", "姓名", "電話", "縣市", "基地地址", "屋齡", "地主/住戶概況", "希望了解", "其他說明", "處理狀態", "備註", "處理人", "處理時間", "通知信"];
   const lines = [header.map((h) => csvCell(h)).join(",")];
 
   for (const r of rows) {
     lines.push([
-      r.id, r.created_at, r.name, r.phone, r.city, r.address,
+      r.id, taipeiTime(r.created_at), r.name, r.phone, r.city, r.address,
       r.age, r.owners, r.type, r.message, CONTACT_STATUS_LABELS[r.status] || r.status,
-      r.note, r.handled_by, r.handled_at, r.mail_status === "sent" ? "已寄出" : r.mail_status === "failed" ? "寄送失敗" : "處理中"
+      r.note, r.handled_by, taipeiTime(r.handled_at), r.mail_status === "sent" ? "已寄出" : r.mail_status === "failed" ? "寄送失敗" : "處理中"
     ].map((v, i) => csvCell(v, i === 3)).join(","));
   }
 
   console.log("contacts exported", rows.length, me.email);
 
-  const date = new Date().toISOString().slice(0, 10);
+  const date = taipeiTime(new Date()).slice(0, 10);
   return new Response("\uFEFF" + lines.join("\r\n"), {
     headers: {
       "Content-Type": "text/csv; charset=utf-8",
@@ -1564,6 +1564,15 @@ async function exportContactsCsv(url, env, me) {
       "Cache-Control": "no-store"
     }
   });
+}
+
+// 資料庫內一律存 UTC（D1 的 CURRENT_TIMESTAMP 是 UTC，保存期限比對也依賴它）；
+// 所有給人看的輸出（後台、CSV、備份檔名）轉成台灣時間 GMT+8。
+function taipeiTime(v) {
+  if (!v) return "";
+  const d = v instanceof Date ? v : new Date(String(v).replace(" ", "T") + (/[zZ]|[+-]\d\d:?\d\d$/.test(String(v)) ? "" : "Z"));
+  if (Number.isNaN(d.getTime())) return String(v);
+  return new Date(d.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 19).replace("T", " ");
 }
 
 function retentionDays(env) {
@@ -1611,7 +1620,14 @@ async function backupD1(env) {
     "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY name"
   ).all()).results || [];
 
-  const snapshot = { database: "fullhome-cms-db", created_at: new Date().toISOString(), tables: {} };
+  const now = new Date();
+  const snapshot = {
+    database: "fullhome-cms-db",
+    created_at: now.toISOString(),
+    created_at_taipei: taipeiTime(now) + " (GMT+8)",
+    note: "資料表內的時間欄位為 UTC",
+    tables: {}
+  };
   let rowCount = 0;
 
   for (const t of tables) {
@@ -1620,8 +1636,8 @@ async function backupD1(env) {
     rowCount += rows.length;
   }
 
-  // 例：20261015-020000-123（含毫秒，避免同一秒內重複執行時互相覆蓋）
-  const stamp = snapshot.created_at.replace(/[-:]/g, "").replace("T", "-").replace(".", "-").replace("Z", "");
+  // 檔名用台灣時間，例：20261015-020000-123（含毫秒，避免同一秒內重複執行時互相覆蓋）
+  const stamp = taipeiTime(now).replace(/[-:]/g, "").replace(" ", "-") + "-" + String(now.getMilliseconds()).padStart(3, "0");
   const key = `d1/fullhome-cms-db-${stamp}.json`;
   await env.BACKUPS.put(key, JSON.stringify(snapshot), { httpMetadata: { contentType: "application/json" } });
 
