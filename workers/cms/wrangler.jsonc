@@ -32,7 +32,9 @@
   // 非機密設定（AUD 與 team domain 都會出現在公開的登入轉址網址中）
   "vars": {
     "ACCESS_TEAM_DOMAIN": "https://da-li.cloudflareaccess.com",
-    "ACCESS_AUD": "daeb672686dea5daf2b819f477ccf8f8dee84281da44b4ceb9ff187eb0a29d7c"
+    "ACCESS_AUD": "daeb672686dea5daf2b819f477ccf8f8dee84281da44b4ceb9ff187eb0a29d7c",
+    // 系統管理員：永遠擁有全部權限（含權限管理），不受後台設定影響，避免被鎖在外面
+    "SUPER_ADMINS": "dennis.chen@da-li.com.tw,mis@da-li.com.tw"
   },
 
   "observability": {

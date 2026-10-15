@@ -24,8 +24,10 @@ export default {
     const isAdminArea =
       path === "/admin/" || path.startsWith("/api/admin/");
 
+    let auth = null;
+
     if (isAdminArea) {
-      const auth = await verifyAccess(request, env);
+      auth = await verifyAccess(request, env);
       if (!auth.ok) {
         console.warn("Access JWT rejected:", auth.reason, path);
         return path.startsWith("/api/")
@@ -43,6 +45,35 @@ export default {
       }
     }
 
+    // ===== 第三層：後台帳號權限（誰可以改哪些區塊）=====
+    let me = null;
+
+    if (path.startsWith("/api/admin/")) {
+      const authEmail = auth.email;
+
+      try {
+        me = await loadAdminUser(env, authEmail);
+      } catch (error) {
+        console.error("load admin user failed:", error);
+        return json({ ok: false, message: "權限資料讀取失敗，請稍後再試。" }, 500);
+      }
+
+      if (!me) {
+        return json(
+          { ok: false, message: `此帳號（${authEmail}）尚未開通後台權限，請聯絡系統管理員。` },
+          403
+        );
+      }
+
+      const need = requiredPermission(path);
+      if (need && !me.permissions.includes(need)) {
+        return json(
+          { ok: false, message: `您沒有「${PERMISSION_LABELS[need]}」的權限。` },
+          403
+        );
+      }
+    }
+
     try {
       if (path === "/admin" || path === "/admin/") {
         return htmlResponse(adminHtml());
@@ -57,7 +88,7 @@ export default {
       }
 
       if (path === "/api/admin/bootstrap" && request.method === "GET") {
-        return adminBootstrap(env);
+        return adminBootstrap(env, me);
       }
 
       if (path === "/api/admin/company" && request.method === "PUT") {
@@ -116,6 +147,21 @@ export default {
           env,
           Number(docMatch[1])
         );
+      }
+
+      // ===== 權限管理 =====
+      if (path === "/api/admin/users" && request.method === "POST") {
+        return createAdminUser(request, env, me);
+      }
+
+      const userMatch = path.match(/^\/api\/admin\/users\/(\d+)$/);
+
+      if (userMatch && request.method === "PUT") {
+        return updateAdminUser(request, env, me, Number(userMatch[1]));
+      }
+
+      if (userMatch && request.method === "DELETE") {
+        return deleteAdminUser(env, me, Number(userMatch[1]));
       }
 
       // ===== 常見問題 FAQ =====
@@ -240,7 +286,7 @@ async function publicInvestors(env) {
 }
 
 
-async function adminBootstrap(env) {
+async function adminBootstrap(env, me) {
 
   const company =
     await env.DB.prepare(
@@ -287,7 +333,22 @@ async function adminBootstrap(env) {
       documents.results || [],
 
     faqs:
-      await listFaqs(env, false)
+      await listFaqs(env, false),
+
+    me,
+
+    users:
+      me && me.permissions.includes("users")
+        ? await listAdminUsers(env)
+        : [],
+
+    super_admins:
+      me && me.permissions.includes("users")
+        ? superAdmins(env)
+        : [],
+
+    permission_labels:
+      PERMISSION_LABELS
   });
 }
 
@@ -1295,6 +1356,186 @@ function slug(value) {
 }
 
 
+// ===== 後台帳號權限 =====
+// 登入（身分驗證）由 Cloudflare Access 負責；這裡決定「登入後能改哪些區塊」。
+// SUPER_ADMINS（wrangler.jsonc）永遠擁有全部權限，不會被鎖在外面。
+
+const PERMISSIONS = ["company", "board", "documents", "faqs", "users"];
+
+const PERMISSION_LABELS = {
+  company: "公司資料",
+  board: "董事會管理",
+  documents: "文件管理",
+  faqs: "常見問題",
+  users: "權限管理"
+};
+
+// 啟用權限功能前就能登入後台的帳號，先保留原本的編輯權限（不含權限管理）
+const ADMIN_USER_SEED = [
+  ["mis@full-home.com.tw", "馥鴻 MIS"],
+  ["ira.peng@full-home.com.tw", "彭靜怡"],
+  ["kevin.hsieh@full-home.com.tw", "Kevin Hsieh"]
+];
+
+let adminTableReady = false;
+
+function superAdmins(env) {
+  return String(env.SUPER_ADMINS || "")
+    .split(",")
+    .map((x) => x.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function parsePermissions(value) {
+  const list = Array.isArray(value) ? value : String(value || "").split(",");
+  return [...new Set(list.map((x) => String(x).trim()).filter((x) => PERMISSIONS.includes(x)))];
+}
+
+function requiredPermission(path) {
+  if (path.startsWith("/api/admin/company")) return "company";
+  if (path.startsWith("/api/admin/board")) return "board";
+  if (path.startsWith("/api/admin/documents")) return "documents";
+  if (path.startsWith("/api/admin/faqs")) return "faqs";
+  if (path.startsWith("/api/admin/users")) return "users";
+  return null; // bootstrap 等唯讀端點：只要是開通的帳號即可
+}
+
+async function ensureAdminTable(env) {
+  if (adminTableReady) return;
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS admin_users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL UNIQUE,
+      name TEXT,
+      permissions TEXT NOT NULL DEFAULT '',
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_by TEXT
+    )
+  `).run();
+
+  const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM admin_users").first();
+
+  if (!row || Number(row.n) === 0) {
+    await env.DB.batch(
+      ADMIN_USER_SEED.map(([email, name]) =>
+        env.DB.prepare(
+          "INSERT INTO admin_users (email, name, permissions, is_active, updated_by) VALUES (?, ?, ?, 1, 'system')"
+        ).bind(email, name, "company,board,documents,faqs")
+      )
+    );
+  }
+
+  adminTableReady = true;
+}
+
+async function loadAdminUser(env, email) {
+  const e = String(email || "").trim().toLowerCase();
+  if (!e) return null;
+
+  if (superAdmins(env).includes(e)) {
+    return { email: e, name: "系統管理員", permissions: [...PERMISSIONS], is_super: true };
+  }
+
+  await ensureAdminTable(env);
+
+  const row = await env.DB.prepare(
+    "SELECT * FROM admin_users WHERE lower(email) = ? AND is_active = 1"
+  ).bind(e).first();
+
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    email: e,
+    name: row.name || "",
+    permissions: parsePermissions(row.permissions),
+    is_super: false
+  };
+}
+
+async function listAdminUsers(env) {
+  await ensureAdminTable(env);
+  const result = await env.DB.prepare(
+    "SELECT * FROM admin_users ORDER BY is_active DESC, email ASC"
+  ).all();
+  return (result.results || []).map((u) => ({ ...u, permissions: parsePermissions(u.permissions) }));
+}
+
+function normalizeAdminUser(body) {
+  return {
+    email: clean(body.email, 180).toLowerCase(),
+    name: clean(body.name, 80),
+    permissions: parsePermissions(body.permissions),
+    is_active:
+      body.is_active === false || body.is_active === "false" || Number(body.is_active) === 0 ? 0 : 1
+  };
+}
+
+async function createAdminUser(request, env, me) {
+  await ensureAdminTable(env);
+  const u = normalizeAdminUser(await request.json());
+
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(u.email)) {
+    return json({ ok: false, message: "Email 格式不正確。" }, 400);
+  }
+  if (superAdmins(env).includes(u.email)) {
+    return json({ ok: false, message: "此帳號是系統管理員，已擁有全部權限。" }, 400);
+  }
+
+  const exists = await env.DB.prepare(
+    "SELECT id FROM admin_users WHERE lower(email) = ?"
+  ).bind(u.email).first();
+  if (exists) {
+    return json({ ok: false, message: "此帳號已存在，請直接編輯。" }, 400);
+  }
+
+  const result = await env.DB.prepare(`
+    INSERT INTO admin_users (email, name, permissions, is_active, created_at, updated_at, updated_by)
+    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+  `).bind(u.email, u.name, u.permissions.join(","), u.is_active, me.email).run();
+
+  return json({ ok: true, id: result.meta?.last_row_id, message: "帳號已新增。" });
+}
+
+async function updateAdminUser(request, env, me, id) {
+  await ensureAdminTable(env);
+
+  const row = await env.DB.prepare("SELECT * FROM admin_users WHERE id = ?").bind(id).first();
+  if (!row) return json({ ok: false, message: "找不到此帳號。" }, 404);
+
+  if (!me.is_super && String(row.email).toLowerCase() === me.email) {
+    return json({ ok: false, message: "不能修改自己的權限，請由其他管理員處理。" }, 400);
+  }
+
+  const u = normalizeAdminUser({ ...(await request.json()), email: row.email });
+
+  await env.DB.prepare(`
+    UPDATE admin_users
+    SET name = ?, permissions = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP, updated_by = ?
+    WHERE id = ?
+  `).bind(u.name, u.permissions.join(","), u.is_active, me.email, id).run();
+
+  return json({ ok: true, message: "權限已更新。" });
+}
+
+async function deleteAdminUser(env, me, id) {
+  await ensureAdminTable(env);
+
+  const row = await env.DB.prepare("SELECT email FROM admin_users WHERE id = ?").bind(id).first();
+  if (!row) return json({ ok: false, message: "找不到此帳號。" }, 404);
+
+  if (!me.is_super && String(row.email).toLowerCase() === me.email) {
+    return json({ ok: false, message: "不能刪除自己的帳號。" }, 400);
+  }
+
+  await env.DB.prepare("DELETE FROM admin_users WHERE id = ?").bind(id).run();
+  return json({ ok: true, message: "帳號已刪除。" });
+}
+
+
 // ===== 常見問題 FAQ =====
 // 資料表第一次使用時自動建立，並帶入官網原本的 4 題。
 
@@ -1976,6 +2217,12 @@ th{
       常見問題
     </button>
 
+    <button
+      data-target="users"
+    >
+      權限管理
+    </button>
+
   </div>
 
 </aside>
@@ -1989,12 +2236,15 @@ th{
       網站管理後台
     </h1>
 
-    <a
-      href="/"
-      target="_blank"
-    >
-      開啟官網 ↗
-    </a>
+    <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+      <span id="whoami" class="muted"></span>
+      <a
+        href="/"
+        target="_blank"
+      >
+        開啟官網 ↗
+      </a>
+    </div>
 
   </div>
 
@@ -2920,6 +3170,61 @@ th{
 
   </section>
 
+
+  <section
+    id="users"
+    class="section"
+  >
+
+    <div class="panel">
+      <h2>新增後台帳號</h2>
+
+      <p class="muted" style="margin-top:-8px">
+        這裡決定「登入後可以改哪些區塊」。新帳號還需要加到 Cloudflare Access 的允許名單，才能收到登入驗證碼。
+      </p>
+
+      <form id="userForm" class="grid2">
+        <div class="field">
+          <label>Email</label>
+          <input name="email" type="email" required placeholder="name@full-home.com.tw">
+        </div>
+
+        <div class="field">
+          <label>姓名 / 備註</label>
+          <input name="name" maxlength="80">
+        </div>
+
+        <div class="field full">
+          <label>可編輯的區塊</label>
+          <div id="userFormPerms" style="display:flex;gap:16px;flex-wrap:wrap"></div>
+        </div>
+
+        <div class="field full">
+          <button class="btn primary" type="submit">新增帳號</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="panel">
+      <h2>帳號與權限</h2>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>帳號</th>
+              <th>可編輯的區塊</th>
+              <th style="width:80px">狀態</th>
+              <th style="width:150px">動作</th>
+            </tr>
+          </thead>
+          <tbody id="userRows"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </section>
+
 </main>
 
 </div>
@@ -3095,6 +3400,10 @@ async function load() {
   renderDocs();
 
   renderFaqs();
+
+  applyPermissions();
+
+  renderUsers();
 
   renderCounts();
 }
@@ -3900,6 +4209,191 @@ async function removeDoc(
     );
   }
 }
+
+
+// ===== 權限 =====
+
+var SECTION_PERMISSION = {
+  company: "company",
+  board: "board",
+  documents: "documents",
+  faqs: "faqs",
+  users: "users"
+};
+
+function can(perm) {
+  return !!(state.me && (state.me.permissions || []).indexOf(perm) >= 0);
+}
+
+function permLabel(p) {
+  return (state.permission_labels || {})[p] || p;
+}
+
+function applyPermissions() {
+  var me = state.me || { permissions: [] };
+
+  document.getElementById("whoami").textContent = me.is_super
+    ? "登入身分：" + me.email + "｜系統管理員"
+    : "登入身分：" + (me.name ? me.name + "（" + me.email + "）" : me.email);
+
+  document.querySelectorAll(".nav button").forEach(function(btn) {
+    var need = SECTION_PERMISSION[btn.dataset.target];
+    btn.style.display = !need || can(need) ? "" : "none";
+  });
+
+  var active = document.querySelector(".nav button.active");
+  if (active && active.style.display === "none") {
+    document.querySelector('.nav button[data-target="dashboard"]').click();
+  }
+}
+
+function permCheckboxes(selected, attr) {
+  return Object.keys(state.permission_labels || {}).map(function(p) {
+    var checked = (selected || []).indexOf(p) >= 0 ? " checked" : "";
+    return '<label style="display:inline-flex;gap:6px;align-items:center;font-weight:600">' +
+      '<input type="checkbox" ' + attr + ' value="' + p + '"' + checked + ' style="width:auto">' +
+      esc(permLabel(p)) + '</label>';
+  }).join(" ");
+}
+
+function renderUsers() {
+  if (!can("users")) return;
+
+  var formBox = document.getElementById("userFormPerms");
+  if (!formBox.dataset.ready) {
+    formBox.innerHTML = permCheckboxes(["faqs"], "data-new-perm");
+    formBox.dataset.ready = "1";
+  }
+
+  var tbody = document.getElementById("userRows");
+  tbody.innerHTML = "";
+
+  (state.super_admins || []).forEach(function(email) {
+    var tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td><strong>' + esc(email) + '</strong><div class="muted">系統管理員（設定檔）</div></td>' +
+      '<td>全部</td>' +
+      '<td><span class="badge">啟用</span></td>' +
+      '<td class="muted">由設定檔管理</td>';
+    tbody.appendChild(tr);
+  });
+
+  (state.users || []).forEach(function(u) {
+    var tr = document.createElement("tr");
+    tr.dataset.userId = u.id;
+
+    var labels = (u.permissions || []).map(permLabel).join("、") || '<span class="muted">（無）</span>';
+
+    tr.innerHTML =
+      '<td><strong>' + esc(u.email) + '</strong><div class="muted">' + esc(u.name || "") + '</div></td>' +
+      '<td data-field="perms">' + labels + '</td>' +
+      '<td data-field="active"><span class="badge">' + (u.is_active ? "啟用" : "停用") + '</span></td>' +
+      '<td data-actions>' +
+        '<button class="btn ghost" data-edit-user="' + u.id + '">編輯</button> ' +
+        '<button class="btn danger" data-delete-user="' + u.id + '">刪除</button>' +
+      '</td>';
+
+    tbody.appendChild(tr);
+  });
+
+  tbody.querySelectorAll("[data-edit-user]").forEach(function(btn) {
+    btn.onclick = function() { startUserEdit(Number(btn.dataset.editUser)); };
+  });
+
+  tbody.querySelectorAll("[data-delete-user]").forEach(function(btn) {
+    btn.onclick = function() { removeUser(Number(btn.dataset.deleteUser)); };
+  });
+}
+
+function startUserEdit(id) {
+  var u = (state.users || []).find(function(x) { return x.id === id; });
+  if (!u) return;
+
+  var tr = document.querySelector('tr[data-user-id="' + id + '"]');
+
+  tr.querySelector('[data-field="perms"]').innerHTML =
+    '<input data-edit="name" placeholder="姓名 / 備註" value="' + escAttr(u.name || "") + '" style="margin-bottom:8px">' +
+    '<div style="display:flex;gap:12px;flex-wrap:wrap">' + permCheckboxes(u.permissions, "data-edit-perm") + '</div>';
+
+  tr.querySelector('[data-field="active"]').innerHTML =
+    '<select data-edit="is_active">' +
+      '<option value="true"' + (u.is_active ? " selected" : "") + '>啟用</option>' +
+      '<option value="false"' + (!u.is_active ? " selected" : "") + '>停用</option>' +
+    '</select>';
+
+  tr.querySelector("[data-actions]").innerHTML =
+    '<button class="btn primary" data-save-user>儲存</button> ' +
+    '<button class="btn ghost" data-cancel-user>取消</button>';
+
+  tr.querySelector("[data-save-user]").onclick = function() { saveUser(id); };
+  tr.querySelector("[data-cancel-user]").onclick = function() { renderUsers(); };
+}
+
+async function saveUser(id) {
+  var tr = document.querySelector('tr[data-user-id="' + id + '"]');
+
+  var body = {
+    name: tr.querySelector('[data-edit="name"]').value.trim(),
+    is_active: tr.querySelector('[data-edit="is_active"]').value === "true",
+    permissions: Array.prototype.map.call(
+      tr.querySelectorAll("[data-edit-perm]:checked"),
+      function(x) { return x.value; }
+    )
+  };
+
+  try {
+    await api("/api/admin/users/" + id, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    flash("權限已更新。");
+    await load();
+  } catch (err) {
+    flash(err.message, false);
+  }
+}
+
+async function removeUser(id) {
+  if (!confirm("確定刪除此帳號的後台權限？")) return;
+
+  try {
+    await api("/api/admin/users/" + id, { method: "DELETE" });
+    flash("帳號已刪除。");
+    await load();
+  } catch (err) {
+    flash(err.message, false);
+  }
+}
+
+document
+  .getElementById("userForm")
+  .addEventListener("submit", async function(e) {
+    e.preventDefault();
+
+    var body = {
+      email: e.target.elements.email.value.trim(),
+      name: e.target.elements.name.value.trim(),
+      is_active: true,
+      permissions: Array.prototype.map.call(
+        e.target.querySelectorAll("[data-new-perm]:checked"),
+        function(x) { return x.value; }
+      )
+    };
+
+    try {
+      await api("/api/admin/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      e.target.reset();
+      flash("帳號已新增。");
+      await load();
+    } catch (err) {
+      flash(err.message, false);
+    }
+  });
 
 
 // ===== 常見問題 =====
