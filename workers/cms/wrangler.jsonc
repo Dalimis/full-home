@@ -1,7 +1,7 @@
 {
   // fullhome-cms：投資人專區 CMS（後台 /admin/、admin API、公開 API、檔案下載）
   // 注意：用 wrangler deploy 部署時，這份設定會「覆蓋」Dashboard 上的路由、變數與繫結。
-  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "$schema": "node_modules/wrangler/config-schema.json",
   "name": "fullhome-cms",
   "main": "src/index.js",
   "compatibility_date": "2026-09-01",
@@ -21,8 +21,7 @@
     {
       "binding": "DB",
       "database_name": "fullhome-cms-db",
-      // TODO：執行 `npx wrangler d1 list` 取得後填入
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+      "database_id": "afc512c2-803f-4f8c-9701-d9d76b96f73a"
     }
   ],
 

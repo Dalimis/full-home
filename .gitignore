@@ -1,6 +1,6 @@
-﻿Thumbs.db
-desktop.ini
-node_modules/
-.wrangler/
 .dev.vars
 .env
+.wrangler/
+desktop.ini
+node_modules/
+﻿Thumbs.db
