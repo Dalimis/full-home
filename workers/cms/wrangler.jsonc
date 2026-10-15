@@ -15,8 +15,10 @@
     { "pattern": "www.full-home.com.tw/api/admin*", "zone_name": "full-home.com.tw" },
     { "pattern": "www.full-home.com.tw/api/public/investors*", "zone_name": "full-home.com.tw" },
     { "pattern": "www.full-home.com.tw/files/*", "zone_name": "full-home.com.tw" },
-    // 首頁經過 Worker，把後台編輯的內容套進 HTML；失敗時直接回傳 Pages 原始頁面
-    { "pattern": "www.full-home.com.tw/", "zone_name": "full-home.com.tw" },
+    // 首頁經過 Worker，把後台編輯的內容套進 HTML；失敗時直接回傳 Pages 原始頁面。
+    // 必須用 /*：沒有萬用字元的路由不會匹配帶查詢字串的網址（?fbclid=、?utm_source=、編輯器的 ?cms-edit=1）。
+    // 其他路徑由 Worker 原封不動轉給 Pages；/api/contact 有更精確的路由，仍由 fullhome-contact 處理。
+    { "pattern": "www.full-home.com.tw/*", "zone_name": "full-home.com.tw" },
     // 後台上傳的頁面圖片（R2 media/ 前綴）
     { "pattern": "www.full-home.com.tw/media/*", "zone_name": "full-home.com.tw" }
   ],

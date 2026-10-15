@@ -198,6 +198,11 @@ export default {
         return deleteFaq(env, Number(faqMatch[1]));
       }
 
+      // 不是 CMS 負責的路徑（官網其他頁面、CSS、JS、圖片）：原封不動交給 Pages
+      if (!path.startsWith("/api/")) {
+        return fetch(request);
+      }
+
       return json(
         {
           ok: false,
