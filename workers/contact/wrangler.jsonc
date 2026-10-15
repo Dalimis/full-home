@@ -1,0 +1,30 @@
+{
+  // fullhome-contact：官網「免費初步評估」表單 → Microsoft Graph 寄信
+  // 注意：用 wrangler deploy 部署時，這份設定會覆蓋 Dashboard 上的路由與一般變數。
+  // CLIENT_SECRET 是 secret，不寫在這裡，也不會被部署覆蓋。
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fullhome-contact",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+
+  "workers_dev": false,
+  "preview_urls": false,
+
+  // www 與根網域都綁；根網域目前會被 Redirect Rule 301 到 www，保留作為備援
+  "routes": [
+    { "pattern": "www.full-home.com.tw/api/contact*", "zone_name": "full-home.com.tw" },
+    { "pattern": "full-home.com.tw/api/contact*", "zone_name": "full-home.com.tw" }
+  ],
+
+  "vars": {
+    "TENANT_ID": "45b3a3c9-cacd-4b73-8d7c-d92d95b08999",
+    "CLIENT_ID": "293fc697-1bfa-4fce-b1c7-a86e054a7040",
+    "MAIL_FROM": "mis@full-home.com.tw",
+    // TODO：確認 Dashboard 上 MAIL_TO 的完整值後再接 Git 部署
+    "MAIL_TO": "mis@da-li.com.tw,ira.peng@full-home.com.tw,kevin.hsieh@full-home.com.tw"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}
