@@ -14,7 +14,11 @@
     { "pattern": "www.full-home.com.tw/admin*", "zone_name": "full-home.com.tw" },
     { "pattern": "www.full-home.com.tw/api/admin*", "zone_name": "full-home.com.tw" },
     { "pattern": "www.full-home.com.tw/api/public/investors*", "zone_name": "full-home.com.tw" },
-    { "pattern": "www.full-home.com.tw/files/*", "zone_name": "full-home.com.tw" }
+    { "pattern": "www.full-home.com.tw/files/*", "zone_name": "full-home.com.tw" },
+    // 首頁經過 Worker，把後台編輯的內容套進 HTML；失敗時直接回傳 Pages 原始頁面
+    { "pattern": "www.full-home.com.tw/", "zone_name": "full-home.com.tw" },
+    // 後台上傳的頁面圖片（R2 media/ 前綴）
+    { "pattern": "www.full-home.com.tw/media/*", "zone_name": "full-home.com.tw" }
   ],
 
   "d1_databases": [

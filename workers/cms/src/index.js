@@ -1,5 +1,5 @@
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
     // ===== Admin canonical redirect =====
@@ -79,6 +79,16 @@ export default {
         return htmlResponse(adminHtml());
       }
 
+      // 首頁：把後台編輯過的文字/圖片套進 HTML（HTMLRewriter，搜尋引擎也看得到）
+      if (path === "/" && request.method === "GET") {
+        ctx?.passThroughOnException?.();
+        return renderHomepage(request, env);
+      }
+
+      if (path.startsWith("/media/") && request.method === "GET") {
+        return serveMedia(path, env);
+      }
+
       if (path === "/api/public/investors" && request.method === "GET") {
         return publicInvestors(env);
       }
@@ -147,6 +157,15 @@ export default {
           env,
           Number(docMatch[1])
         );
+      }
+
+      // ===== 頁面內容 =====
+      if (path === "/api/admin/content" && request.method === "PUT") {
+        return saveSiteContent(request, env, me);
+      }
+
+      if (path === "/api/admin/content/image" && request.method === "POST") {
+        return uploadSiteImage(request, env);
       }
 
       // ===== 權限管理 =====
@@ -336,6 +355,11 @@ async function adminBootstrap(env, me) {
       await listFaqs(env, false),
 
     me,
+
+    content_keys:
+      me && me.permissions.includes("pages")
+        ? [...(await loadSiteContent(env)).keys()]
+        : [],
 
     users:
       me && me.permissions.includes("users")
@@ -1356,13 +1380,202 @@ function slug(value) {
 }
 
 
+// ===== 頁面內容（首頁每個區塊的文字與圖片）=====
+// HTML 裡用 data-edit / data-edit-img / data-edit-bg 標記可編輯區塊；
+// 這裡只存「有改過的」值，沒改過的維持 HTML 原本內容。
+
+let siteContentTableReady = false;
+
+async function ensureSiteContentTable(env) {
+  if (siteContentTableReady) return;
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS site_content (
+      key TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      value TEXT NOT NULL,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_by TEXT
+    )
+  `).run();
+  siteContentTableReady = true;
+}
+
+async function loadSiteContent(env) {
+  await ensureSiteContentTable(env);
+  const result = await env.DB.prepare("SELECT key, type, value FROM site_content").all();
+  return new Map((result.results || []).map((r) => [r.key, r]));
+}
+
+const CONTENT_KEY_RE = /^[a-z0-9]+(?:[.-][a-z0-9]+)*$/;
+const MEDIA_URL_RE = /^\/media\/[a-z0-9-]+\.(?:png|jpe?g|webp)$/;
+
+// 只允許少數行內標籤，且不保留任何屬性
+function sanitizeInlineHtml(html) {
+  return String(html ?? "")
+    .slice(0, 5000)
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<(\/?)([a-zA-Z0-9]+)[^>]*>/g, (m, close, tag) => {
+      tag = tag.toLowerCase();
+      if (tag === "br") return close ? "" : "<br>";
+      if (["span", "strong", "b", "em", "small"].includes(tag)) return `<${close}${tag}>`;
+      return "";
+    })
+    .replace(/<(?!\/?(?:br|span|strong|b|em|small)>)/g, "&lt;")
+    .replace(/&nbsp;/g, " ")
+    .trim();
+}
+
+async function saveSiteContent(request, env, me) {
+  await ensureSiteContentTable(env);
+  const body = await request.json();
+  const changes = body && typeof body.changes === "object" ? body.changes : {};
+  const keys = Object.keys(changes);
+
+  if (!keys.length) return json({ ok: false, message: "沒有需要儲存的修改。" }, 400);
+  if (keys.length > 300) return json({ ok: false, message: "一次修改太多項目。" }, 400);
+
+  const stmts = [];
+
+  for (const key of keys) {
+    if (!CONTENT_KEY_RE.test(key) || key.length > 60) {
+      return json({ ok: false, message: `欄位代碼不正確：${key}` }, 400);
+    }
+
+    const c = changes[key];
+
+    if (c === null) {
+      stmts.push(env.DB.prepare("DELETE FROM site_content WHERE key = ?").bind(key));
+      continue;
+    }
+
+    let type, value;
+
+    if (c.type === "text") {
+      type = "text";
+      value = sanitizeInlineHtml(c.value);
+      if (!value) return json({ ok: false, message: `「${key}」不可空白；要恢復原文請用「還原預設」。` }, 400);
+    } else if (c.type === "image") {
+      type = "image";
+      value = String(c.value || "");
+      if (!MEDIA_URL_RE.test(value)) return json({ ok: false, message: "圖片網址不正確。" }, 400);
+    } else {
+      return json({ ok: false, message: "內容類型不正確。" }, 400);
+    }
+
+    stmts.push(env.DB.prepare(`
+      INSERT INTO site_content (key, type, value, updated_at, updated_by)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        type = excluded.type, value = excluded.value,
+        updated_at = CURRENT_TIMESTAMP, updated_by = excluded.updated_by
+    `).bind(key, type, value, me.email));
+  }
+
+  await env.DB.batch(stmts);
+  console.log("site content saved", me.email, keys.join(","));
+  return json({ ok: true, message: `已儲存 ${keys.length} 處修改。` });
+}
+
+const IMAGE_SIGNATURES = {
+  png: (b) => b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47,
+  jpg: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff,
+  webp: (b) => b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+               b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50
+};
+
+async function uploadSiteImage(request, env) {
+  const form = await request.formData();
+  const file = form.get("file");
+
+  if (!(file instanceof File)) return json({ ok: false, message: "請選擇圖片。" }, 400);
+  if (file.size > 5 * 1024 * 1024) return json({ ok: false, message: "圖片上限為 5 MB。" }, 400);
+
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const ext = Object.keys(IMAGE_SIGNATURES).find((k) => IMAGE_SIGNATURES[k](buf));
+  if (!ext) return json({ ok: false, message: "只接受 JPG、PNG、WebP 圖片。" }, 400);
+
+  const name = `${Date.now()}-${crypto.randomUUID()}.${ext}`;
+  const contentType = ext === "jpg" ? "image/jpeg" : `image/${ext}`;
+
+  await env.FILES.put(`media/${name}`, buf, { httpMetadata: { contentType } });
+
+  return json({ ok: true, url: `/media/${name}` });
+}
+
+async function serveMedia(path, env) {
+  if (!MEDIA_URL_RE.test(path)) return new Response("Not found", { status: 404 });
+
+  const object = await env.FILES.get(path.slice(1));
+  if (!object) return new Response("Not found", { status: 404 });
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("etag", object.httpEtag);
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("X-Content-Type-Options", "nosniff");
+  return new Response(object.body, { headers });
+}
+
+async function renderHomepage(request, env) {
+  // 不帶快取條件去拿原始 HTML，避免 304 讓瀏覽器沿用舊內容
+  const headers = new Headers(request.headers);
+  headers.delete("If-None-Match");
+  headers.delete("If-Modified-Since");
+  const origin = await fetch(new Request(request.url, { method: "GET", headers, redirect: "manual" }));
+
+  const ct = origin.headers.get("content-type") || "";
+  if (origin.status !== 200 || !ct.includes("text/html")) return origin;
+
+  let content;
+  try {
+    content = await loadSiteContent(env);
+  } catch (error) {
+    console.error("load site content failed:", error);
+    return origin;
+  }
+
+  const get = (el, attr, type) => {
+    const c = content.get(el.getAttribute(attr));
+    return c && c.type === type ? c.value : null;
+  };
+
+  const rewritten = new HTMLRewriter()
+    .on("[data-edit]", {
+      element(el) {
+        const v = get(el, "data-edit", "text");
+        if (v !== null) el.setInnerContent(v, { html: true });
+      }
+    })
+    .on("[data-edit-img]", {
+      element(el) {
+        const v = get(el, "data-edit-img", "image");
+        if (v !== null) el.setAttribute("src", v);
+      }
+    })
+    .on("[data-edit-bg]", {
+      element(el) {
+        const v = get(el, "data-edit-bg", "image");
+        if (v !== null) el.setAttribute("style", `--edit-bg:url("${v}")`);
+      }
+    })
+    .transform(origin);
+
+  const out = new Response(rewritten.body, rewritten);
+  out.headers.delete("ETag");
+  out.headers.delete("Last-Modified");
+  out.headers.set("Cache-Control", "no-cache");
+  return out;
+}
+
+
 // ===== 後台帳號權限 =====
 // 登入（身分驗證）由 Cloudflare Access 負責；這裡決定「登入後能改哪些區塊」。
 // SUPER_ADMINS（wrangler.jsonc）永遠擁有全部權限，不會被鎖在外面。
 
-const PERMISSIONS = ["company", "board", "documents", "faqs", "users"];
+const PERMISSIONS = ["pages", "company", "board", "documents", "faqs", "users"];
 
 const PERMISSION_LABELS = {
+  pages: "頁面內容",
   company: "公司資料",
   board: "董事會管理",
   documents: "文件管理",
@@ -1392,6 +1605,7 @@ function parsePermissions(value) {
 }
 
 function requiredPermission(path) {
+  if (path.startsWith("/api/admin/content")) return "pages";
   if (path.startsWith("/api/admin/company")) return "company";
   if (path.startsWith("/api/admin/board")) return "board";
   if (path.startsWith("/api/admin/documents")) return "documents";
@@ -2191,6 +2405,12 @@ th{
       data-target="dashboard"
     >
       儀表板
+    </button>
+
+    <button
+      data-target="pages"
+    >
+      頁面內容
     </button>
 
     <button
@@ -3170,6 +3390,35 @@ th{
 
   </section>
 
+
+  <section
+    id="pages"
+    class="section"
+  >
+
+    <div class="panel" style="padding:16px 20px">
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <strong style="color:var(--blue)">首頁內容編輯</strong>
+        <span class="muted">點文字直接修改；點 Logo 或「更換背景圖」上傳新圖片。改完按「儲存」才會上線。</span>
+        <span style="flex:1"></span>
+        <span id="pageDirty" class="badge">尚無修改</span>
+        <button class="btn ghost" type="button" id="pageRevertKey" disabled>還原此區塊預設</button>
+        <button class="btn ghost" type="button" id="pageDiscard">放棄修改</button>
+        <button class="btn primary" type="button" id="pageSave">儲存並上線</button>
+      </div>
+      <div id="pageSelected" class="muted" style="margin-top:8px">尚未選取區塊</div>
+      <input type="file" id="pageImageInput" accept="image/jpeg,image/png,image/webp" style="display:none">
+    </div>
+
+    <div class="panel" style="padding:0;overflow:hidden">
+      <iframe
+        id="pageFrame"
+        title="首頁編輯預覽"
+        style="width:100%;height:78vh;border:0;display:block;background:#fff"
+      ></iframe>
+    </div>
+
+  </section>
 
   <section
     id="users"
@@ -4214,6 +4463,7 @@ async function removeDoc(
 // ===== 權限 =====
 
 var SECTION_PERMISSION = {
+  pages: "pages",
   company: "company",
   board: "board",
   documents: "documents",
@@ -4394,6 +4644,220 @@ document
       flash(err.message, false);
     }
   });
+
+
+// ===== 頁面內容（視覺化編輯）=====
+
+var pageEditor = {
+  dirty: {},
+  selectedKey: null,
+  imageTarget: null,
+  loaded: false
+};
+
+function pageDirtyCount() {
+  return Object.keys(pageEditor.dirty).length;
+}
+
+function updatePageToolbar() {
+  var n = pageDirtyCount();
+  document.getElementById("pageDirty").textContent = n ? ("未儲存修改：" + n + " 處") : "尚無修改";
+  document.getElementById("pageSave").disabled = !n;
+
+  var key = pageEditor.selectedKey;
+  var overridden = key && ((state.content_keys || []).indexOf(key) >= 0 || pageEditor.dirty[key]);
+  document.getElementById("pageRevertKey").disabled = !overridden;
+  document.getElementById("pageSelected").textContent = key
+    ? ("目前選取：" + key + (overridden ? "（已修改過）" : "（原始內容）"))
+    : "尚未選取區塊";
+}
+
+function loadPageFrame() {
+  pageEditor.dirty = {};
+  pageEditor.selectedKey = null;
+  updatePageToolbar();
+  var frame = document.getElementById("pageFrame");
+  frame.onload = setupPageFrame;
+  frame.src = "/?cms-edit=1&t=" + Date.now();
+  pageEditor.loaded = true;
+}
+
+function setupPageFrame() {
+  var frame = document.getElementById("pageFrame");
+  var doc = frame.contentDocument;
+  if (!doc) return;
+
+  var style = doc.createElement("style");
+  style.textContent =
+    "[data-reveal]{opacity:1!important;transform:none!important;transition:none!important}" +
+    "[data-edit]{cursor:text}" +
+    "[data-edit]:hover{outline:2px dashed #FF7000;outline-offset:3px}" +
+    "[data-edit].cms-active{outline:2px solid #FF7000;outline-offset:3px;background:rgba(255,112,0,.06)}" +
+    "[data-edit].cms-dirty{box-shadow:0 0 0 4px rgba(255,112,0,.18)}" +
+    "[data-edit-img]{cursor:pointer}" +
+    "[data-edit-img]:hover{outline:2px dashed #FF7000;outline-offset:3px}" +
+    ".cms-bg-btn{position:absolute;top:84px;right:16px;z-index:50;background:#FF7000;color:#fff;border:0;border-radius:8px;padding:8px 12px;font-weight:800;cursor:pointer;box-shadow:0 6px 18px rgba(0,0,0,.25)}";
+  doc.head.appendChild(style);
+
+  doc.querySelectorAll("[data-edit-bg]").forEach(function(sec) {
+    if (getComputedStyle(sec).position === "static") sec.style.position = "relative";
+    var btn = doc.createElement("button");
+    btn.type = "button";
+    btn.className = "cms-bg-btn";
+    btn.textContent = "更換背景圖";
+    btn.addEventListener("click", function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      pickPageImage(sec.getAttribute("data-edit-bg"), sec, "bg");
+    });
+    sec.appendChild(btn);
+  });
+
+  doc.addEventListener("click", function(e) {
+    var link = e.target.closest("a");
+    if (link) e.preventDefault();
+
+    var img = e.target.closest("[data-edit-img]");
+    if (img) {
+      e.preventDefault();
+      pickPageImage(img.getAttribute("data-edit-img"), img, "img");
+      return;
+    }
+
+    var el = e.target.closest("[data-edit]");
+    if (!el) return;
+    e.preventDefault();
+    activatePageText(el);
+  }, true);
+
+  doc.addEventListener("submit", function(e) { e.preventDefault(); }, true);
+}
+
+function activatePageText(el) {
+  var doc = el.ownerDocument;
+  doc.querySelectorAll(".cms-active").forEach(function(x) {
+    x.classList.remove("cms-active");
+    x.removeAttribute("contenteditable");
+  });
+
+  el.classList.add("cms-active");
+  el.setAttribute("contenteditable", "true");
+  el.focus();
+
+  pageEditor.selectedKey = el.getAttribute("data-edit");
+  updatePageToolbar();
+
+  if (!el.dataset.cmsBound) {
+    el.dataset.cmsBound = "1";
+
+    el.addEventListener("keydown", function(e) {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        doc.execCommand("insertLineBreak");
+      }
+    });
+
+    el.addEventListener("paste", function(e) {
+      e.preventDefault();
+      var text = (e.clipboardData || window.clipboardData).getData("text/plain");
+      doc.execCommand("insertText", false, text);
+    });
+
+    el.addEventListener("input", function() {
+      pageEditor.dirty[el.getAttribute("data-edit")] = { type: "text", value: el.innerHTML };
+      el.classList.add("cms-dirty");
+      updatePageToolbar();
+    });
+  }
+}
+
+function pickPageImage(key, target, kind) {
+  pageEditor.imageTarget = { key: key, el: target, kind: kind };
+  pageEditor.selectedKey = key;
+  updatePageToolbar();
+  var input = document.getElementById("pageImageInput");
+  input.value = "";
+  input.click();
+}
+
+document.getElementById("pageImageInput").addEventListener("change", async function(e) {
+  var file = e.target.files && e.target.files[0];
+  var t = pageEditor.imageTarget;
+  if (!file || !t) return;
+
+  if (file.size > 5 * 1024 * 1024) {
+    flash("圖片上限為 5 MB。", false);
+    return;
+  }
+
+  var fd = new FormData();
+  fd.append("file", file);
+
+  try {
+    flash("圖片上傳中…");
+    var data = await api("/api/admin/content/image", { method: "POST", body: fd });
+
+    if (t.kind === "img") {
+      t.el.setAttribute("src", data.url);
+    } else {
+      t.el.style.setProperty("--edit-bg", "url(" + JSON.stringify(data.url) + ")");
+    }
+
+    pageEditor.dirty[t.key] = { type: "image", value: data.url };
+    updatePageToolbar();
+    flash("圖片已上傳，按「儲存並上線」後生效。");
+  } catch (err) {
+    flash(err.message, false);
+  }
+});
+
+document.getElementById("pageSave").addEventListener("click", async function() {
+  if (!pageDirtyCount()) return;
+  var btn = this;
+  btn.disabled = true;
+  btn.textContent = "儲存中…";
+
+  try {
+    var data = await api("/api/admin/content", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ changes: pageEditor.dirty })
+    });
+    flash(data.message || "已儲存。");
+    await load();
+    loadPageFrame();
+  } catch (err) {
+    flash(err.message, false);
+  } finally {
+    btn.textContent = "儲存並上線";
+    updatePageToolbar();
+  }
+});
+
+document.getElementById("pageDiscard").addEventListener("click", function() {
+  if (pageDirtyCount() && !confirm("確定放棄所有未儲存的修改？")) return;
+  loadPageFrame();
+});
+
+document.getElementById("pageRevertKey").addEventListener("click", function() {
+  var key = pageEditor.selectedKey;
+  if (!key) return;
+  if (!confirm("將「" + key + "」還原為網站原始內容？（按儲存後生效）")) return;
+  pageEditor.dirty[key] = null;
+  updatePageToolbar();
+  flash("已標記還原，按「儲存並上線」後生效。");
+});
+
+window.addEventListener("beforeunload", function(e) {
+  if (pageDirtyCount()) {
+    e.preventDefault();
+    e.returnValue = "";
+  }
+});
+
+document.querySelector('.nav button[data-target="pages"]').addEventListener("click", function() {
+  if (!pageEditor.loaded) loadPageFrame();
+});
 
 
 // ===== 常見問題 =====
