@@ -79,6 +79,17 @@ export default {
       }
     }
 
+    // ===== 稽核紀錄：所有後台寫入操作（誰、何時、做了什麼、結果）=====
+    if (me && request.method !== "GET") {
+      const summary = await auditSummary(request);
+      const response = await handle();
+      ctx?.waitUntil?.(writeAudit(env, me.email, request.method, path, response.status, summary));
+      return response;
+    }
+
+    return handle();
+
+    async function handle() {
     try {
       if (path === "/admin" || path === "/admin/") {
         return htmlResponse(adminHtml());
@@ -192,6 +203,11 @@ export default {
         return json({ ok: true, result: await runMaintenance(env, me.email) });
       }
 
+      if (path === "/api/admin/backups/test-alert" && request.method === "POST") {
+        const r = await sendAlert(env, { issues: [`這是測試通知（由 ${me.email} 從後台發送），收到代表異常通知功能正常。`] });
+        return json({ ok: r === "sent", message: r === "sent" ? "測試通知已寄出。" : "寄送失敗：" + r }, r === "sent" ? 200 : 502);
+      }
+
       if (path === "/api/admin/backups/download" && request.method === "GET") {
         return downloadBackup(url, env);
       }
@@ -199,6 +215,18 @@ export default {
       // ===== 頁面內容 =====
       if (path === "/api/admin/content" && request.method === "PUT") {
         return saveSiteContent(request, env, me);
+      }
+
+      if (path === "/api/admin/content/history" && request.method === "GET") {
+        return listContentHistory(url, env);
+      }
+
+      if (path === "/api/admin/content/revert" && request.method === "POST") {
+        return revertContentHistory(request, env, me);
+      }
+
+      if (path === "/api/admin/audit" && request.method === "GET") {
+        return listAudit(url, env);
       }
 
       if (path === "/api/admin/content/image" && request.method === "POST") {
@@ -263,6 +291,7 @@ export default {
         },
         500
       );
+    }
     }
   }
 };
@@ -949,6 +978,18 @@ async function uploadDocument(request, env) {
     );
   }
 
+  // 檢查檔案內容的檔頭，副檔名必須與實際格式相符（擋下改副檔名的偽裝檔）
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (!fileMatchesExtension(bytes, ext)) {
+    return json(
+      {
+        ok: false,
+        message: "檔案內容與副檔名不符，請確認檔案是否正確。"
+      },
+      400
+    );
+  }
+
   const safeCategory =
     slug(category) || "misc";
 
@@ -962,7 +1003,7 @@ async function uploadDocument(request, env) {
 
   await env.FILES.put(
     key,
-    file.stream(),
+    bytes,
     {
       httpMetadata: {
         contentType: mimeType
@@ -974,7 +1015,10 @@ async function uploadDocument(request, env) {
     }
   );
 
-  const result =
+  // 資料庫寫入失敗時，刪除剛上傳的檔案，避免留下孤兒檔案
+  let result;
+  try {
+    result =
     await env.DB.prepare(
       `
       INSERT INTO documents (
@@ -1026,6 +1070,11 @@ async function uploadDocument(request, env) {
         is_public
       )
       .run();
+  } catch (error) {
+    console.error("document insert failed, removing uploaded object:", key, error);
+    await env.FILES.delete(key).catch((e) => console.error("orphan cleanup failed:", key, e));
+    throw error;
+  }
 
   return json({
     ok: true,
@@ -1172,14 +1221,8 @@ async function deleteDocument(
       .first();
 
 
-  if (doc?.file_key) {
-
-    await env.FILES.delete(
-      doc.file_key
-    );
-  }
-
-
+  // 先刪資料庫紀錄（前台立即不再顯示），成功後才刪檔案；
+  // 檔案刪除失敗只記錄，留下的檔案會在每日備份的孤兒檔案檢查中回報
   await env.DB.prepare(
     `
     DELETE FROM documents
@@ -1188,6 +1231,14 @@ async function deleteDocument(
   )
     .bind(id)
     .run();
+
+  if (doc?.file_key) {
+    try {
+      await env.FILES.delete(doc.file_key);
+    } catch (error) {
+      console.error("R2 delete failed (orphan left):", doc.file_key, error);
+    }
+  }
 
 
   return json({
@@ -1601,11 +1652,39 @@ async function runMaintenance(env, by) {
     result.errors.push("purge: " + e.message);
   }
 
+  try {
+    await ensureAuditTable(env);
+    const r = await env.DB.prepare("DELETE FROM audit_logs WHERE at < datetime('now', '-730 days')").run();
+    result.purged_audit = r.meta?.changes || 0;
+  } catch (e) {
+    result.errors.push("audit purge: " + e.message);
+  }
+
+  try {
+    result.orphans = await findOrphanFiles(env);
+  } catch (e) {
+    result.errors.push("orphans: " + e.message);
+  }
+
   if (!env.BACKUPS) {
     result.errors.push("BACKUPS bucket not bound");
   } else {
     try { result.d1 = await backupD1(env); } catch (e) { result.errors.push("d1: " + e.message); }
     try { result.files = await backupFiles(env); } catch (e) { result.errors.push("files: " + e.message); }
+  }
+
+  // 健康檢查放在備份之後，備份失敗也會被列為異常
+  try {
+    result.health = await runHealthChecks(env, result);
+  } catch (e) {
+    result.health = { issues: ["健康檢查本身執行失敗：" + e.message], checks: {} };
+  }
+
+  if (by === "cron" && result.health.issues.length) {
+    result.health.alert = await sendAlert(env, result.health);
+  }
+
+  if (env.BACKUPS) {
     await env.BACKUPS.put("status/last-run.json", JSON.stringify(result, null, 2), {
       httpMetadata: { contentType: "application/json" }
     });
@@ -1613,6 +1692,200 @@ async function runMaintenance(env, by) {
 
   console.log("maintenance", JSON.stringify(result));
   return result;
+}
+
+// ===== 稽核紀錄 =====
+
+let auditTableReady = false;
+
+async function ensureAuditTable(env) {
+  if (auditTableReady) return;
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      at TEXT DEFAULT CURRENT_TIMESTAMP,
+      email TEXT, method TEXT, path TEXT, status INTEGER, summary TEXT
+    )
+  `).run();
+  auditTableReady = true;
+}
+
+// 記錄內容摘要：JSON 取前 500 字；上傳只記檔名，不存檔案內容
+async function auditSummary(request) {
+  try {
+    const ct = request.headers.get("content-type") || "";
+    const c = request.clone();
+    if (ct.includes("multipart/form-data")) {
+      const form = await c.formData();
+      const f = form.get("file");
+      const title = form.get("title");
+      return JSON.stringify({ file: f && f.name, size: f && f.size, title: title || undefined });
+    }
+    if (ct.includes("json")) return (await c.text()).slice(0, 500);
+  } catch (e) {
+    return "";
+  }
+  return "";
+}
+
+async function writeAudit(env, email, method, path, status, summary) {
+  try {
+    await ensureAuditTable(env);
+    await env.DB.prepare(
+      "INSERT INTO audit_logs (email, method, path, status, summary) VALUES (?, ?, ?, ?, ?)"
+    ).bind(email, method, path, status, summary).run();
+  } catch (e) {
+    console.error("audit write failed:", e);
+  }
+}
+
+async function listAudit(url, env) {
+  await ensureAuditTable(env);
+  const before = Number(url.searchParams.get("before_id")) || 0;
+  const rows = (await env.DB.prepare(
+    `SELECT * FROM audit_logs ${before ? "WHERE id < ?" : ""} ORDER BY id DESC LIMIT 101`
+  ).bind(...(before ? [before] : [])).all()).results || [];
+  return json({ ok: true, items: rows.slice(0, 100), has_more: rows.length > 100 });
+}
+
+// ===== 每日健康檢查 =====
+// 有異常才寄信（ALERT_TO，經由 fullhome-contact 寄出），沒事不打擾。
+
+async function runHealthChecks(env, maintenance) {
+  const issues = [];
+  const checks = {};
+
+  // 1. 官網首頁（同網域子請求會直接到 Pages 原站）
+  try {
+    const r = await fetch(SITE_ORIGIN + "/", { headers: { "User-Agent": "fullhome-healthcheck" } });
+    const t = await r.text();
+    checks.homepage = r.status;
+    if (r.status !== 200 || !t.includes("data-edit=")) issues.push(`官網首頁異常（HTTP ${r.status}）`);
+  } catch (e) {
+    checks.homepage = "error";
+    issues.push("官網首頁無法連線：" + e.message);
+  }
+
+  // 2. 投資人資料
+  try {
+    const c = await env.DB.prepare("SELECT company_name FROM company_profile WHERE id = 1").first();
+    checks.investors = c && c.company_name ? "ok" : "missing";
+    if (!c || !c.company_name) issues.push("公司基本資料不存在或為空白，投資人專區會顯示不完整");
+  } catch (e) {
+    checks.investors = "error";
+    issues.push("資料庫查詢失敗：" + e.message);
+  }
+
+  // 3. 聯絡表單 Worker 是否存活
+  if (env.CONTACT) {
+    try {
+      const r = await env.CONTACT.fetch("http://internal/ping");
+      checks.contact_worker = r.status;
+      if (!r.ok) issues.push(`聯絡表單服務異常（HTTP ${r.status}）`);
+    } catch (e) {
+      checks.contact_worker = "error";
+      issues.push("聯絡表單服務無法連線：" + e.message);
+    }
+  }
+
+  // 4. 過去 24 小時通知信寄送失敗、或卡在處理中超過 1 小時
+  try {
+    await ensureContactTable(env);
+    const f = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM contact_submissions WHERE mail_status = 'failed' AND created_at >= datetime('now', '-1 day')"
+    ).first();
+    const p = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM contact_submissions WHERE mail_status = 'pending' AND created_at < datetime('now', '-1 hour')"
+    ).first();
+    checks.mail_failed_24h = f.n;
+    checks.mail_pending = p.n;
+    if (f.n) issues.push(`過去 24 小時有 ${f.n} 筆聯絡表單的通知信寄送失敗（資料已保存，請到後台「聯絡表單」查看並回電）`);
+    if (p.n) issues.push(`有 ${p.n} 筆聯絡表單的通知信未完成寄送（資料已保存，請到後台查看）`);
+  } catch (e) {
+    issues.push("聯絡表單紀錄查詢失敗：" + e.message);
+  }
+
+  // 5. 備份
+  if (maintenance.errors.length) issues.push("備份或清理有錯誤：" + maintenance.errors.join("；"));
+
+  // 6. 孤兒文件檔案
+  if (maintenance.orphans && maintenance.orphans.documents) {
+    issues.push(`R2 有 ${maintenance.orphans.documents} 個文件檔案沒有對應的文件紀錄（例：${maintenance.orphans.sample.slice(0, 3).join("、")}）`);
+  }
+
+  // 7. Entra 密鑰到期（ENTRA_SECRET_EXPIRES = YYYY-MM-DD）
+  const exp = String(env.ENTRA_SECRET_EXPIRES || "");
+  if (/^\d{4}-\d{2}-\d{2}$/.test(exp)) {
+    const days = Math.floor((Date.parse(exp + "T00:00:00+08:00") - Date.now()) / 86400000);
+    checks.entra_secret_days_left = days;
+    if (days <= 30) {
+      issues.push(days < 0
+        ? `聯絡表單寄信用的 Entra Client Secret 已於 ${exp} 到期，通知信無法寄出（表單資料仍會保存）`
+        : `聯絡表單寄信用的 Entra Client Secret 將於 ${exp} 到期（剩 ${days} 天），請盡快更新`);
+    }
+  } else {
+    checks.entra_secret_days_left = "未設定 ENTRA_SECRET_EXPIRES";
+  }
+
+  return { issues, checks };
+}
+
+async function sendAlert(env, health) {
+  if (!env.CONTACT) return "CONTACT service binding 未設定";
+
+  const date = taipeiTime(new Date());
+  const items = health.issues.map((i) => `<li style="margin:6px 0">${escHtml(i)}</li>`).join("");
+  const html = `
+    <div style="font-family:'Microsoft JhengHei',Arial,sans-serif;color:#171827">
+      <h2 style="color:#0D045F;margin:0 0 8px">馥鴻官網每日檢查發現 ${health.issues.length} 項異常</h2>
+      <p style="color:#6c7282;margin:0 0 12px">檢查時間：${escHtml(date)}（台灣時間）</p>
+      <ul style="padding-left:20px">${items}</ul>
+      <p style="margin-top:16px"><a href="${SITE_ORIGIN}/admin/">開啟網站管理後台</a>（「系統備份」可查看完整檢查結果）</p>
+    </div>`;
+
+  try {
+    const r = await env.CONTACT.fetch("http://internal/alert", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subject: `【馥鴻官網】每日檢查異常 ${health.issues.length} 項`, html })
+    });
+    return r.ok ? "sent" : `failed ${r.status}`;
+  } catch (e) {
+    return "failed: " + e.message;
+  }
+}
+
+function escHtml(v) {
+  return String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[c]));
+}
+
+// R2 裡沒有被任何資料引用的檔案（只回報，不自動刪除）
+async function findOrphanFiles(env) {
+  const docKeys = new Set(
+    ((await env.DB.prepare("SELECT file_key FROM documents WHERE file_key IS NOT NULL").all()).results || [])
+      .map((r) => r.file_key)
+  );
+
+  await ensureSiteContentTable(env);
+  const mediaKeys = new Set(
+    ((await env.DB.prepare("SELECT value FROM site_content WHERE type = 'image'").all()).results || [])
+      .map((r) => String(r.value).replace(/^\//, ""))
+  );
+
+  const orphans = [];
+  let cursor;
+  do {
+    const page = await env.FILES.list({ cursor, limit: 1000 });
+    for (const o of page.objects) {
+      // media/ 是頁面圖片：上傳後尚未儲存或已被替換的舊圖，屬正常情況，只計數
+      const used = o.key.startsWith("media/") ? mediaKeys.has(o.key) : docKeys.has(o.key);
+      if (!used) orphans.push(o.key);
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  const documents = orphans.filter((k) => !k.startsWith("media/"));
+  return { documents: documents.length, media: orphans.length - documents.length, sample: documents.slice(0, 10) };
 }
 
 async function backupD1(env) {
@@ -1727,6 +2000,18 @@ let siteContentTableReady = false;
 async function ensureSiteContentTable(env) {
   if (siteContentTableReady) return;
   await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS site_content_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id TEXT NOT NULL,
+      source TEXT,
+      key TEXT NOT NULL,
+      old_type TEXT, old_value TEXT,
+      new_type TEXT, new_value TEXT,
+      changed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      changed_by TEXT
+    )
+  `).run();
+  await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS site_content (
       key TEXT PRIMARY KEY,
       type TEXT NOT NULL,
@@ -1774,9 +2059,14 @@ function sanitizeInlineHtml(html) {
 }
 
 async function saveSiteContent(request, env, me) {
-  await ensureSiteContentTable(env);
   const body = await request.json();
   const changes = body && typeof body.changes === "object" ? body.changes : {};
+  return applyContentChanges(env, me, changes, "edit");
+}
+
+// 套用頁面內容修改，並把「修改前 / 修改後」記錄到 site_content_history（同一批次一個 batch_id）
+async function applyContentChanges(env, me, changes, source) {
+  await ensureSiteContentTable(env);
   const keys = Object.keys(changes);
 
   if (!keys.length) return json({ ok: false, message: "沒有需要儲存的修改。" }, 400);
@@ -1824,9 +2114,85 @@ async function saveSiteContent(request, env, me) {
     `).bind(key, type, value, me.email));
   }
 
+  // 修改前的值
+  const placeholders = keys.map(() => "?").join(",");
+  const before = new Map(
+    ((await env.DB.prepare(`SELECT key, type, value FROM site_content WHERE key IN (${placeholders})`)
+      .bind(...keys).all()).results || []).map((r) => [r.key, r])
+  );
+
+  const batchId = crypto.randomUUID();
+  for (const key of keys) {
+    const oldRow = before.get(key) || null;
+    const c = changes[key];
+    const newType = c === null ? null : (c.type === "text" ? "text" : c.type === "plain" ? "plain" : "image");
+    const newValue = c === null ? null
+      : newType === "text" ? sanitizeInlineHtml(c.value)
+      : newType === "plain" ? String(c.value ?? "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim().slice(0, SEO_MAX[key] || 300)
+      : String(c.value);
+
+    // 沒有實際變化的不記錄
+    if ((oldRow ? oldRow.value : null) === newValue) continue;
+
+    stmts.push(env.DB.prepare(`
+      INSERT INTO site_content_history (batch_id, source, key, old_type, old_value, new_type, new_value, changed_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(batchId, source, key, oldRow ? oldRow.type : null, oldRow ? oldRow.value : null, newType, newValue, me.email));
+  }
+
   await env.DB.batch(stmts);
-  console.log("site content saved", me.email, keys.join(","));
-  return json({ ok: true, message: `已儲存 ${keys.length} 處修改。` });
+  console.log("site content saved", me.email, source, keys.join(","));
+  return json({ ok: true, batch_id: batchId, message: `已儲存 ${keys.length} 處修改。` });
+}
+
+// 修改紀錄：依批次分組，最近的在前
+async function listContentHistory(url, env) {
+  await ensureSiteContentTable(env);
+  const rows = (await env.DB.prepare(`
+    SELECT * FROM site_content_history
+    WHERE batch_id IN (
+      SELECT batch_id FROM site_content_history
+      GROUP BY batch_id ORDER BY MAX(id) DESC LIMIT 40
+    )
+    ORDER BY id DESC
+  `).all()).results || [];
+
+  const batches = [];
+  const byId = new Map();
+  for (const r of rows) {
+    let b = byId.get(r.batch_id);
+    if (!b) {
+      b = { batch_id: r.batch_id, changed_at: r.changed_at, changed_by: r.changed_by, source: r.source, items: [] };
+      byId.set(r.batch_id, b);
+      batches.push(b);
+    }
+    b.items.push({ id: r.id, key: r.key, old_type: r.old_type, old_value: r.old_value, new_type: r.new_type, new_value: r.new_value });
+  }
+
+  return json({ ok: true, batches });
+}
+
+// 還原：把指定批次（或其中一項）改回修改前的值；還原本身也會產生一筆新的紀錄
+async function revertContentHistory(request, env, me) {
+  await ensureSiteContentTable(env);
+  const body = await request.json();
+  const batchId = String(body.batch_id || "");
+  const itemId = Number(body.item_id) || 0;
+
+  const rows = (await env.DB.prepare(
+    itemId
+      ? "SELECT * FROM site_content_history WHERE batch_id = ? AND id = ?"
+      : "SELECT * FROM site_content_history WHERE batch_id = ? ORDER BY id"
+  ).bind(...(itemId ? [batchId, itemId] : [batchId])).all()).results || [];
+
+  if (!rows.length) return json({ ok: false, message: "找不到這筆修改紀錄。" }, 404);
+
+  const changes = {};
+  for (const r of rows) {
+    changes[r.key] = r.old_value === null ? null : { type: r.old_type, value: r.old_value };
+  }
+
+  return applyContentChanges(env, me, changes, "revert");
 }
 
 const IMAGE_SIGNATURES = {
@@ -1994,6 +2360,7 @@ function requiredPermission(path) {
   if (path.startsWith("/api/admin/content")) return "pages";
   if (path.startsWith("/api/admin/contacts")) return "contacts";
   if (path.startsWith("/api/admin/backups")) return "users";
+  if (path.startsWith("/api/admin/audit")) return "users";
   if (path.startsWith("/api/admin/company")) return "company";
   if (path.startsWith("/api/admin/board")) return "board";
   if (path.startsWith("/api/admin/documents")) return "documents";
@@ -2250,6 +2617,20 @@ async function deleteFaq(env, id) {
   return json({ ok: true, message: "常見問題已刪除。" });
 }
 
+
+// 檔頭（magic bytes）
+function fileMatchesExtension(b, ext) {
+  const starts = (...sig) => sig.every((v, i) => b[i] === v);
+  switch (ext) {
+    case "pdf": return starts(0x25, 0x50, 0x44, 0x46, 0x2d);                         // %PDF-
+    case "docx": case "xlsx": case "pptx": return starts(0x50, 0x4b, 0x03, 0x04);   // ZIP（Office Open XML）
+    case "doc": case "xls": case "ppt": return starts(0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1); // OLE2
+    case "jpg": case "jpeg": return starts(0xff, 0xd8, 0xff);
+    case "png": return starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
+    case "webp": return starts(0x52, 0x49, 0x46, 0x46) && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50;
+    default: return false;
+  }
+}
 
 const MIME_BY_EXT = {
   pdf: "application/pdf",
@@ -2848,6 +3229,12 @@ th{
       data-target="backups"
     >
       系統備份
+    </button>
+
+    <button
+      data-target="audit"
+    >
+      操作紀錄
     </button>
 
   </div>
@@ -3879,6 +4266,17 @@ th{
       </div>
     </div>
 
+    <div class="panel" id="historyPanel">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+        <h2 style="margin:0">修改紀錄</h2>
+        <button class="btn ghost" type="button" id="historyToggle">展開紀錄</button>
+      </div>
+      <div id="historyBody" style="display:none;margin-top:14px">
+        <p class="muted" style="margin-top:0">最近 40 次儲存。可以整次還原，或只還原其中一個區塊；還原也會留下一筆紀錄。</p>
+        <div id="historyList"></div>
+      </div>
+    </div>
+
     <div class="panel" style="padding:0;overflow:hidden">
       <iframe
         id="pageFrame"
@@ -3944,7 +4342,7 @@ th{
   >
 
     <div class="panel">
-      <h2>系統備份</h2>
+      <h2>系統備份與健康檢查</h2>
       <p class="muted" style="margin-top:-8px">
         每天凌晨 2 點自動備份：資料庫完整快照（保留最近 30 份）、上傳檔案增量複製到獨立的備份空間。
         來源檔案被刪除時，備份不會跟著刪除。
@@ -3953,6 +4351,7 @@ th{
       <div class="actions">
         <button class="btn primary" type="button" id="backupRun">立即備份</button>
         <button class="btn ghost" type="button" id="backupRefresh">重新整理</button>
+        <button class="btn ghost" type="button" id="alertTest">寄送測試通知</button>
       </div>
     </div>
 
@@ -3970,6 +4369,34 @@ th{
           </thead>
           <tbody id="backupRows"></tbody>
         </table>
+      </div>
+    </div>
+
+  </section>
+
+  <section
+    id="audit"
+    class="section"
+  >
+
+    <div class="panel">
+      <h2>操作紀錄</h2>
+      <p class="muted" style="margin-top:-8px">後台所有新增、修改、刪除的操作，保留 2 年。</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:170px">時間</th>
+              <th style="width:230px">帳號</th>
+              <th>操作</th>
+              <th style="width:80px">結果</th>
+            </tr>
+          </thead>
+          <tbody id="auditRows"></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button class="btn ghost" type="button" id="auditMore" style="display:none">載入更多</button>
       </div>
     </div>
 
@@ -5021,6 +5448,7 @@ var SECTION_PERMISSION = {
   pages: "pages",
   contacts: "contacts",
   backups: "users",
+  audit: "users",
   company: "company",
   board: "board",
   documents: "documents",
@@ -5389,6 +5817,7 @@ document.getElementById("pageSave").addEventListener("click", async function() {
     flash(data.message || "已儲存。");
     await load();
     loadPageFrame();
+    if (document.getElementById("historyBody").style.display !== "none") loadHistory();
   } catch (err) {
     flash(err.message, false);
   } finally {
@@ -5600,6 +6029,16 @@ async function loadBackups() {
         (last.files ? "<div>檔案：本次複製 " + last.files.copied + "、已存在 " + last.files.skipped +
           (last.files.pending ? "、待下次複製 " + last.files.pending : "") + "</div>" : "") +
         "<div>清理過期表單紀錄：" + last.purged_contacts + " 筆</div>" +
+        (last.health
+          ? (last.health.issues.length
+              ? '<div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:#fff0f0;color:#912020"><strong>健康檢查發現 ' + last.health.issues.length + " 項異常" +
+                (last.health.alert ? "（通知信：" + esc(last.health.alert) + "）" : "") + "</strong><ul style=" + '"margin:6px 0 0;padding-left:20px"' + ">" +
+                last.health.issues.map(function(i) { return "<li>" + esc(i) + "</li>"; }).join("") + "</ul></div>"
+              : '<div style="margin-top:10px;color:#185b2a;font-weight:800">✓ 健康檢查：官網、投資人資料、聯絡表單服務皆正常</div>') +
+            (typeof last.health.checks.entra_secret_days_left === "number"
+              ? '<div class="muted">Entra 寄信密鑰剩餘 ' + last.health.checks.entra_secret_days_left + " 天</div>"
+              : '<div class="muted">Entra 寄信密鑰到期日：尚未設定</div>')
+          : "") +
         (last.errors && last.errors.length
           ? '<div style="color:#a22;font-weight:800">錯誤：' + esc(last.errors.join("；")) + "</div>"
           : '<div style="color:#185b2a;font-weight:800">✓ 最近一次備份成功</div>');
@@ -5642,6 +6081,15 @@ document.getElementById("backupRun").addEventListener("click", async function() 
 });
 
 document.getElementById("backupRefresh").addEventListener("click", loadBackups);
+
+document.getElementById("alertTest").addEventListener("click", async function() {
+  try {
+    var data = await api("/api/admin/backups/test-alert", { method: "POST" });
+    flash(data.message);
+  } catch (err) {
+    flash(err.message, false);
+  }
+});
 document.querySelector('.nav button[data-target="backups"]').addEventListener("click", loadBackups);
 
 
@@ -5755,6 +6203,179 @@ document.getElementById("seoImageReset").addEventListener("click", function() {
   updatePageToolbar();
   updateSeoPreview();
 });
+
+
+// ===== 修改紀錄（頁面內容）=====
+
+var historyState = { batches: [] };
+
+document.getElementById("historyToggle").addEventListener("click", function() {
+  var body = document.getElementById("historyBody");
+  var open = body.style.display === "none";
+  body.style.display = open ? "" : "none";
+  this.textContent = open ? "收合紀錄" : "展開紀錄";
+  if (open) loadHistory();
+});
+
+function stripTags(v) {
+  var d = document.createElement("div");
+  d.innerHTML = v || "";
+  return d.textContent || "";
+}
+
+function historyValue(type, value) {
+  if (value === null || value === undefined) return '<span class="muted">（網站原始內容）</span>';
+  if (type === "image") {
+    return '<img src="' + escAttr(value) + '" style="max-width:160px;max-height:90px;border-radius:6px;border:1px solid var(--line)">';
+  }
+  var t = stripTags(value);
+  return esc(t.length > 120 ? t.slice(0, 120) + "…" : t);
+}
+
+function historyKeyLabel(key) {
+  if (key === "seo.title") return "網頁標題";
+  if (key === "seo.description") return "搜尋描述";
+  if (key === "seo.og-title") return "分享標題";
+  if (key === "seo.og-description") return "分享描述";
+  if (key === "seo.og-image") return "分享圖片";
+  if (key === "hero.bg") return "首頁大圖";
+  if (key === "contact.bg") return "聯絡區背景";
+  if (key === "header.img-01") return "Logo";
+  return key;
+}
+
+async function loadHistory() {
+  try {
+    var data = await api("/api/admin/content/history");
+    historyState.batches = data.batches || [];
+    renderHistory();
+  } catch (err) {
+    flash(err.message, false);
+  }
+}
+
+function renderHistory() {
+  var box = document.getElementById("historyList");
+  if (!historyState.batches.length) {
+    box.innerHTML = '<p class="muted">尚無修改紀錄。</p>';
+    return;
+  }
+
+  box.innerHTML = historyState.batches.map(function(b, bi) {
+    var rows = b.items.map(function(it) {
+      return "<tr>" +
+        "<td><strong>" + esc(historyKeyLabel(it.key)) + "</strong></td>" +
+        "<td>" + historyValue(it.old_type, it.old_value) + "</td>" +
+        "<td>" + historyValue(it.new_type, it.new_value) + "</td>" +
+        '<td><button class="btn ghost" type="button" data-revert-item="' + bi + ":" + it.id + '">還原這項</button></td>' +
+      "</tr>";
+    }).join("");
+
+    return '<details style="border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin-bottom:10px">' +
+      '<summary style="cursor:pointer;font-weight:800">' +
+        esc(twTime(b.changed_at)) + "｜" + esc(b.changed_by) + "｜" +
+        (b.source === "revert" ? "還原 " : "修改 ") + b.items.length + " 處" +
+      "</summary>" +
+      '<div class="table-wrap" style="margin-top:10px"><table>' +
+        "<thead><tr><th style=" + '"width:140px"' + ">區塊</th><th>修改前</th><th>修改後</th><th style=" + '"width:110px"' + "></th></tr></thead>" +
+        "<tbody>" + rows + "</tbody></table></div>" +
+      '<div class="actions"><button class="btn danger" type="button" data-revert-batch="' + bi + '">還原這次的全部修改</button></div>' +
+    "</details>";
+  }).join("");
+
+  box.querySelectorAll("[data-revert-batch]").forEach(function(btn) {
+    btn.onclick = function() {
+      var b = historyState.batches[Number(btn.dataset.revertBatch)];
+      revertHistory(b.batch_id, 0, "將這次的 " + b.items.length + " 處修改全部改回修改前的內容？");
+    };
+  });
+
+  box.querySelectorAll("[data-revert-item]").forEach(function(btn) {
+    btn.onclick = function() {
+      var parts = btn.dataset.revertItem.split(":");
+      var b = historyState.batches[Number(parts[0])];
+      revertHistory(b.batch_id, Number(parts[1]), "將這個區塊改回修改前的內容？");
+    };
+  });
+}
+
+async function revertHistory(batchId, itemId, question) {
+  if (pageDirtyCount() && !confirm("目前有未儲存的修改，還原後會被捨棄。確定繼續？")) return;
+  if (!confirm(question + "（會立即上線）")) return;
+
+  try {
+    var data = await api("/api/admin/content/revert", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ batch_id: batchId, item_id: itemId })
+    });
+    flash("已還原並上線。" + (data.message ? "（" + data.message + "）" : ""));
+    await load();
+    loadPageFrame();
+    loadHistory();
+  } catch (err) {
+    flash(err.message, false);
+  }
+}
+
+
+// ===== 操作紀錄 =====
+
+var auditState = { items: [] };
+
+var AUDIT_MODULE = [
+  ["/api/admin/content/revert", "還原頁面內容"],
+  ["/api/admin/content/image", "上傳頁面圖片"],
+  ["/api/admin/content", "儲存頁面內容"],
+  ["/api/admin/contacts", "聯絡表單"],
+  ["/api/admin/company", "公司資料"],
+  ["/api/admin/board", "董事會"],
+  ["/api/admin/documents", "文件"],
+  ["/api/admin/faqs", "常見問題"],
+  ["/api/admin/users", "帳號權限"],
+  ["/api/admin/backups/test-alert", "測試通知"],
+  ["/api/admin/backups", "系統備份"]
+];
+
+function auditAction(r) {
+  var label = r.path;
+  for (var i = 0; i < AUDIT_MODULE.length; i++) {
+    if (r.path.indexOf(AUDIT_MODULE[i][0]) === 0) { label = AUDIT_MODULE[i][1]; break; }
+  }
+  var verb = r.method === "POST" ? "新增" : r.method === "PUT" ? "修改" : r.method === "DELETE" ? "刪除" : r.method;
+  if (label.indexOf("儲存") === 0 || label.indexOf("還原") === 0 || label.indexOf("上傳") === 0 || label.indexOf("測試") === 0) verb = "";
+  if (label === "系統備份") verb = "立即執行";
+  var id = r.path.split("/").pop();
+  return (verb ? verb + " " : "") + label + (/^[0-9]+$/.test(id) ? " #" + id : "");
+}
+
+async function loadAudit(append) {
+  var q = append && auditState.items.length ? "?before_id=" + auditState.items[auditState.items.length - 1].id : "";
+  try {
+    var data = await api("/api/admin/audit" + q);
+    auditState.items = append ? auditState.items.concat(data.items) : data.items;
+    document.getElementById("auditMore").style.display = data.has_more ? "" : "none";
+
+    var tbody = document.getElementById("auditRows");
+    tbody.innerHTML = auditState.items.length ? "" : '<tr><td colspan="4" class="muted">尚無紀錄。</td></tr>';
+    auditState.items.forEach(function(r) {
+      var tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td>" + esc(twTime(r.at)) + "</td>" +
+        "<td>" + esc(r.email) + "</td>" +
+        "<td><strong>" + esc(auditAction(r)) + "</strong>" +
+          (r.summary ? '<div class="muted" style="word-break:break-all;max-height:3.2em;overflow:hidden">' + esc(r.summary) + "</div>" : "") +
+        "</td>" +
+        "<td" + (r.status >= 400 ? ' style="color:#a22;font-weight:800"' : "") + ">" + (r.status < 400 ? "成功" : "失敗 " + r.status) + "</td>";
+      tbody.appendChild(tr);
+    });
+  } catch (err) {
+    flash(err.message, false);
+  }
+}
+
+document.getElementById("auditMore").addEventListener("click", function() { loadAudit(true); });
+document.querySelector('.nav button[data-target="audit"]').addEventListener("click", function() { loadAudit(false); });
 
 
 // ===== 常見問題 =====

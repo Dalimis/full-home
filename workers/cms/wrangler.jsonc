@@ -37,7 +37,12 @@
     { "binding": "BACKUPS", "bucket_name": "fullhome-backups" }
   ],
 
-  // 每天 18:00 UTC（台灣 02:00）：備份 + 清理過期的聯絡表單紀錄
+  // 呼叫 fullhome-contact 寄送系統通知信（私有連線，不經過公開網路）
+  "services": [
+    { "binding": "CONTACT", "service": "fullhome-contact" }
+  ],
+
+  // 每天 18:00 UTC（台灣 02:00）：備份 + 清理過期的聯絡表單紀錄 + 健康檢查
   "triggers": {
     "crons": ["0 18 * * *"]
   },
@@ -49,7 +54,9 @@
     // 系統管理員：永遠擁有全部權限（含權限管理），不受後台設定影響，避免被鎖在外面
     "SUPER_ADMINS": "dennis.chen@da-li.com.tw,mis@da-li.com.tw",
     // 聯絡表單紀錄保存天數（個資），超過自動刪除
-    "CONTACT_RETENTION_DAYS": "365"
+    "CONTACT_RETENTION_DAYS": "365",
+    // 聯絡表單寄信用的 Entra Client Secret 到期日（YYYY-MM-DD），到期前 30 天每日提醒；空白則不檢查
+    "ENTRA_SECRET_EXPIRES": ""
   },
 
   "observability": {

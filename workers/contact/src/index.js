@@ -4,6 +4,13 @@ export default {
 
     const url = new URL(request.url);
 
+    // 內部端點：只能經由 fullhome-cms 的 service binding 呼叫（主機名 internal 不會出現在公開路由）
+    if (url.hostname === "internal") {
+      if (url.pathname === "/ping") return json({ ok: true });
+      if (url.pathname === "/alert" && request.method === "POST") return handleAlert(request, env);
+      return json({ ok: false, message: "Not found" }, 404);
+    }
+
     if (url.pathname !== "/api/contact") {
       return json({ ok: false, message: "Not found" }, 404);
     }
@@ -1149,6 +1156,65 @@ full-home.com.tw
     }
   }
 };
+
+
+/*
+ * ===== 系統通知信（健康檢查異常時由 fullhome-cms 呼叫）=====
+ */
+async function getGraphToken(env) {
+  const r = await fetch(
+    `https://login.microsoftonline.com/${encodeURIComponent(env.TENANT_ID)}/oauth2/v2.0/token`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: env.CLIENT_ID,
+        client_secret: env.CLIENT_SECRET,
+        scope: "https://graph.microsoft.com/.default",
+        grant_type: "client_credentials"
+      })
+    }
+  );
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || !data.access_token) throw new Error(`token ${r.status}: ${data.error_description || data.error || ""}`.slice(0, 300));
+  return data.access_token;
+}
+
+async function handleAlert(request, env) {
+  try {
+    const body = await request.json();
+    const to = String(env.ALERT_TO || env.MAIL_FROM || "").split(",").map((x) => x.trim()).filter(Boolean);
+    if (!to.length) return json({ ok: false, message: "ALERT_TO not set" }, 500);
+
+    const token = await getGraphToken(env);
+    const r = await fetch(
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(env.MAIL_FROM)}/sendMail`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: {
+            subject: String(body.subject || "馥鴻官網系統通知").slice(0, 200),
+            importance: "high",
+            body: { contentType: "HTML", content: String(body.html || "") },
+            toRecipients: to.map((address) => ({ emailAddress: { address } }))
+          },
+          saveToSentItems: true
+        })
+      }
+    );
+
+    if (!r.ok) {
+      const t = await r.text();
+      console.error("alert sendMail failed:", r.status, t);
+      return json({ ok: false, message: `graph ${r.status}` }, 502);
+    }
+    return json({ ok: true });
+  } catch (error) {
+    console.error("alert failed:", error);
+    return json({ ok: false, message: String(error.message || error) }, 500);
+  }
+}
 
 
 /*
