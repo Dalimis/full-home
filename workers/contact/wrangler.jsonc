@@ -20,7 +20,6 @@
     "TENANT_ID": "45b3a3c9-cacd-4b73-8d7c-d92d95b08999",
     "CLIENT_ID": "293fc697-1bfa-4fce-b1c7-a86e054a7040",
     "MAIL_FROM": "mis@full-home.com.tw",
-    // TODO：確認 Dashboard 上 MAIL_TO 的完整值後再接 Git 部署
     "MAIL_TO": "mis@da-li.com.tw,ira.peng@full-home.com.tw,kevin.hsieh@full-home.com.tw"
   },
 
