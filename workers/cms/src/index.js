@@ -5678,7 +5678,7 @@ function fillSeoForm(doc) {
   setSeoField("seo.og-description", keys.indexOf("seo.og-description") >= 0 ? ogDesc : "");
 
   document.getElementById("seoImageHint").textContent =
-    keys.indexOf("seo.og-image") >= 0 ? "目前使用：自訂分享圖片" : "目前使用：預設圖片（首頁主視覺）";
+    keys.indexOf("seo.og-image") >= 0 ? "目前使用：自訂分享圖片" : "目前使用：預設分享圖（Logo + 標語）";
 
   updateSeoPreview();
 }
