@@ -632,7 +632,7 @@
       color:var(--muted);
       font-size:.92rem;
     }
-    .faq-item.open .faq-a{max-height:220px}
+    .faq-item.open .faq-a{max-height:800px}
     .faq-item.open .faq-q span:last-child{transform:rotate(45deg)}
 
     /* Footer */
@@ -2328,7 +2328,7 @@
           </p>
         </div>
 
-        <div class="faq-list">
+        <div class="faq-list" data-cms-faq>
           <div class="faq-item">
             <button class="faq-q">
               <span>我不知道適合都更還是危老，也可以諮詢嗎？</span>
@@ -2534,11 +2534,11 @@
       });
     });
 
-    document.querySelectorAll(".faq-q").forEach(button => {
-      button.addEventListener("click", () => {
-        const item = button.closest(".faq-item");
-        item.classList.toggle("open");
-      });
+    // 用事件委派：常見問題會由後台資料重新渲染，按鈕是動態產生的
+    document.addEventListener("click", (e) => {
+      const button = e.target.closest(".faq-q");
+      if (!button) return;
+      button.closest(".faq-item")?.classList.toggle("open");
     });
 
     const revealTargets = document.querySelectorAll(

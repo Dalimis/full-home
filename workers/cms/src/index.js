@@ -118,6 +118,21 @@ export default {
         );
       }
 
+      // ===== 常見問題 FAQ =====
+      if (path === "/api/admin/faqs" && request.method === "POST") {
+        return createFaq(request, env);
+      }
+
+      const faqMatch = path.match(/^\/api\/admin\/faqs\/(\d+)$/);
+
+      if (faqMatch && request.method === "PUT") {
+        return updateFaq(request, env, Number(faqMatch[1]));
+      }
+
+      if (faqMatch && request.method === "DELETE") {
+        return deleteFaq(env, Number(faqMatch[1]));
+      }
+
       return json(
         {
           ok: false,
@@ -217,7 +232,10 @@ async function publicInvestors(env) {
           file_url:
             `/files/${d.id}`
         })
-      )
+      ),
+
+    faqs:
+      await listFaqs(env, true)
   });
 }
 
@@ -266,7 +284,10 @@ async function adminBootstrap(env) {
       board.results || [],
 
     documents:
-      documents.results || []
+      documents.results || [],
+
+    faqs:
+      await listFaqs(env, false)
   });
 }
 
@@ -1274,6 +1295,119 @@ function slug(value) {
 }
 
 
+// ===== 常見問題 FAQ =====
+// 資料表第一次使用時自動建立，並帶入官網原本的 4 題。
+
+const FAQ_SEED = [
+  ["我不知道適合都更還是危老，也可以諮詢嗎？",
+   "可以。只要提供基地地址、屋齡及基本產權概況，我們就能先從初步條件協助判斷可能方向。"],
+  ["只有我一戶有意願，也能先評估嗎？",
+   "可以。前期先了解基地可行性與可能的更新方式，有助於後續與其他地主溝通。"],
+  ["初步評估需要準備很多資料嗎？",
+   "不需要一開始就準備完整文件。地址、屋齡、土地或建物概況，就足以作為第一階段了解基礎。"],
+  ["都更或危老一定會增加很多坪數嗎？",
+   "不一定。實際條件會受到基地大小、使用分區、法規、容積、獎勵條件與建築設計等因素影響，需個案評估。"]
+];
+
+let faqTableReady = false;
+
+async function ensureFaqTable(env) {
+  if (faqTableReady) return;
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS faqs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      question TEXT NOT NULL,
+      answer TEXT NOT NULL,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      is_public INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM faqs"
+  ).first();
+
+  if (!row || Number(row.n) === 0) {
+    await env.DB.batch(
+      FAQ_SEED.map(([q, a], i) =>
+        env.DB.prepare(
+          "INSERT INTO faqs (question, answer, sort_order, is_public) VALUES (?, ?, ?, 1)"
+        ).bind(q, a, (i + 1) * 10)
+      )
+    );
+  }
+
+  faqTableReady = true;
+}
+
+async function listFaqs(env, publicOnly) {
+  await ensureFaqTable(env);
+
+  const sql = publicOnly
+    ? `SELECT id, question, answer, sort_order
+       FROM faqs WHERE is_public = 1
+       ORDER BY sort_order ASC, id ASC`
+    : `SELECT * FROM faqs ORDER BY sort_order ASC, id ASC`;
+
+  const result = await env.DB.prepare(sql).all();
+  return result.results || [];
+}
+
+function normalizeFaq(body) {
+  return {
+    question: clean(body.question, 200),
+    answer: clean(body.answer, 2000),
+    sort_order: toInt(body.sort_order, 0),
+    is_public:
+      body.is_public === false || Number(body.is_public) === 0 || body.is_public === "false"
+        ? 0
+        : 1
+  };
+}
+
+async function createFaq(request, env) {
+  await ensureFaqTable(env);
+  const f = normalizeFaq(await request.json());
+
+  if (!f.question || !f.answer) {
+    return json({ ok: false, message: "問題與回答不可空白。" }, 400);
+  }
+
+  const result = await env.DB.prepare(`
+    INSERT INTO faqs (question, answer, sort_order, is_public, created_at, updated_at)
+    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+  `).bind(f.question, f.answer, f.sort_order, f.is_public).run();
+
+  return json({ ok: true, id: result.meta?.last_row_id, message: "常見問題已新增。" });
+}
+
+async function updateFaq(request, env, id) {
+  await ensureFaqTable(env);
+  const f = normalizeFaq(await request.json());
+
+  if (!f.question || !f.answer) {
+    return json({ ok: false, message: "問題與回答不可空白。" }, 400);
+  }
+
+  await env.DB.prepare(`
+    UPDATE faqs
+    SET question = ?, answer = ?, sort_order = ?, is_public = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).bind(f.question, f.answer, f.sort_order, f.is_public, id).run();
+
+  return json({ ok: true, message: "常見問題已更新。" });
+}
+
+async function deleteFaq(env, id) {
+  await ensureFaqTable(env);
+  await env.DB.prepare("DELETE FROM faqs WHERE id = ?").bind(id).run();
+  return json({ ok: true, message: "常見問題已刪除。" });
+}
+
+
 const MIME_BY_EXT = {
   pdf: "application/pdf",
   doc: "application/msword",
@@ -1834,6 +1968,12 @@ th{
       data-target="documents"
     >
       文件管理
+    </button>
+
+    <button
+      data-target="faqs"
+    >
+      常見問題
     </button>
 
   </div>
@@ -2685,6 +2825,101 @@ th{
 
   </section>
 
+  <section
+    id="faqs"
+    class="section"
+  >
+
+    <div class="panel">
+
+      <h2>
+        新增常見問題
+      </h2>
+
+      <form
+        id="faqForm"
+        class="grid2"
+      >
+
+        <div class="field full">
+          <label>問題</label>
+          <input
+            name="question"
+            required
+            maxlength="200"
+            placeholder="例如：初步評估需要收費嗎？"
+          >
+        </div>
+
+        <div class="field full">
+          <label>回答</label>
+          <textarea
+            name="answer"
+            required
+            maxlength="2000"
+            placeholder="可換行，前台會照樣顯示。"
+          ></textarea>
+        </div>
+
+        <div class="field">
+          <label>排序（數字小的在前）</label>
+          <input
+            name="sort_order"
+            type="number"
+            value="100"
+          >
+        </div>
+
+        <div class="field">
+          <label>公開</label>
+          <select name="is_public">
+            <option value="true">公開</option>
+            <option value="false">隱藏</option>
+          </select>
+        </div>
+
+        <div class="field full">
+          <button
+            class="btn primary"
+            type="submit"
+          >
+            新增常見問題
+          </button>
+        </div>
+
+      </form>
+
+    </div>
+
+
+    <div class="panel">
+
+      <h2>
+        現有常見問題
+      </h2>
+
+      <p class="muted" style="margin-top:-8px">
+        儲存後官網首頁「常見問題」區塊會立即更新；隱藏的題目不會顯示在官網。
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:70px">排序</th>
+              <th>問題 / 回答</th>
+              <th style="width:80px">狀態</th>
+              <th style="width:150px">動作</th>
+            </tr>
+          </thead>
+          <tbody id="faqRows"></tbody>
+        </table>
+      </div>
+
+    </div>
+
+  </section>
+
 </main>
 
 </div>
@@ -2858,6 +3093,8 @@ async function load() {
   renderBoard();
 
   renderDocs();
+
+  renderFaqs();
 
   renderCounts();
 }
@@ -3661,6 +3898,153 @@ async function removeDoc(
       err.message,
       false
     );
+  }
+}
+
+
+// ===== 常見問題 =====
+
+document
+  .getElementById("faqForm")
+  .addEventListener("submit", async function(e) {
+    e.preventDefault();
+
+    var body = Object.fromEntries(new FormData(e.target).entries());
+    body.is_public = body.is_public === "true";
+
+    try {
+      await api("/api/admin/faqs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+
+      e.target.reset();
+      flash("常見問題已新增。");
+      await load();
+    } catch (err) {
+      flash(err.message, false);
+    }
+  });
+
+
+function renderFaqs() {
+  var tbody = document.getElementById("faqRows");
+  tbody.innerHTML = "";
+
+  var list = state.faqs || [];
+
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="muted">尚無常見問題。</td></tr>';
+    return;
+  }
+
+  list.forEach(function(f) {
+    var tr = document.createElement("tr");
+    tr.dataset.faqId = f.id;
+
+    tr.innerHTML =
+      '<td data-field="sort_order">' + esc(f.sort_order || 0) + '</td>' +
+      '<td data-field="qa">' +
+        '<strong>' + esc(f.question) + '</strong>' +
+        '<div class="muted" style="margin-top:6px;white-space:pre-line">' + esc(f.answer) + '</div>' +
+      '</td>' +
+      '<td data-field="is_public"><span class="badge">' + (f.is_public ? "公開" : "隱藏") + '</span></td>' +
+      '<td data-actions>' +
+        '<button class="btn ghost" data-edit-faq="' + f.id + '">編輯</button> ' +
+        '<button class="btn danger" data-delete-faq="' + f.id + '">刪除</button>' +
+      '</td>';
+
+    tbody.appendChild(tr);
+  });
+
+  tbody.querySelectorAll("[data-edit-faq]").forEach(function(btn) {
+    btn.onclick = function() { startFaqEdit(Number(btn.dataset.editFaq)); };
+  });
+
+  tbody.querySelectorAll("[data-delete-faq]").forEach(function(btn) {
+    btn.onclick = function() { removeFaq(Number(btn.dataset.deleteFaq)); };
+  });
+}
+
+
+function startFaqEdit(id) {
+  var f = (state.faqs || []).find(function(x) { return x.id === id; });
+  if (!f) return;
+
+  var tr = document.querySelector('tr[data-faq-id="' + id + '"]');
+  if (!tr) return;
+
+  tr.querySelector('[data-field="sort_order"]').innerHTML =
+    '<input data-edit="sort_order" type="number" value="' + Number(f.sort_order || 0) + '" style="max-width:70px">';
+
+  tr.querySelector('[data-field="qa"]').innerHTML =
+    '<div style="display:grid;gap:8px">' +
+      '<input data-edit="question" maxlength="200" value="' + escAttr(f.question || "") + '">' +
+      '<textarea data-edit="answer" maxlength="2000" style="min-height:110px">' + esc(f.answer || "") + '</textarea>' +
+    '</div>';
+
+  tr.querySelector('[data-field="is_public"]').innerHTML =
+    '<select data-edit="is_public">' +
+      '<option value="true"' + (f.is_public ? " selected" : "") + '>公開</option>' +
+      '<option value="false"' + (!f.is_public ? " selected" : "") + '>隱藏</option>' +
+    '</select>';
+
+  tr.querySelector("[data-actions]").innerHTML =
+    '<button class="btn primary" data-save-faq="' + id + '">儲存</button> ' +
+    '<button class="btn ghost" data-cancel-faq="' + id + '">取消</button>';
+
+  tr.querySelector("[data-save-faq]").onclick = function() { saveFaqInline(id); };
+  tr.querySelector("[data-cancel-faq]").onclick = function() { renderFaqs(); };
+}
+
+
+async function saveFaqInline(id) {
+  var tr = document.querySelector('tr[data-faq-id="' + id + '"]');
+  if (!tr) return;
+
+  var body = {
+    question: tr.querySelector('[data-edit="question"]').value.trim(),
+    answer: tr.querySelector('[data-edit="answer"]').value.trim(),
+    sort_order: Number(tr.querySelector('[data-edit="sort_order"]').value) || 0,
+    is_public: tr.querySelector('[data-edit="is_public"]').value === "true"
+  };
+
+  if (!body.question || !body.answer) {
+    flash("問題與回答不可空白。", false);
+    return;
+  }
+
+  var saveBtn = tr.querySelector("[data-save-faq]");
+  saveBtn.disabled = true;
+  saveBtn.textContent = "儲存中…";
+
+  try {
+    await api("/api/admin/faqs/" + id, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+
+    flash("常見問題已更新。");
+    await load();
+  } catch (err) {
+    flash(err.message, false);
+    saveBtn.disabled = false;
+    saveBtn.textContent = "儲存";
+  }
+}
+
+
+async function removeFaq(id) {
+  if (!confirm("確定刪除這則常見問題？")) return;
+
+  try {
+    await api("/api/admin/faqs/" + id, { method: "DELETE" });
+    flash("常見問題已刪除。");
+    await load();
+  } catch (err) {
+    flash(err.message, false);
   }
 }
 

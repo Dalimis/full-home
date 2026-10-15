@@ -98,6 +98,31 @@
     });
   };
 
+  // 首頁常見問題：後台有資料就取代 HTML 內建的題目；API 失敗時保留原本內容
+  const renderHomeFaq = (faqs) => {
+    const list = document.querySelector('[data-cms-faq]');
+    if (!list || !Array.isArray(faqs)) return;
+
+    const section = list.closest('section');
+    if (!faqs.length) {
+      if (section) section.hidden = true;
+      return;
+    }
+    if (section) section.hidden = false;
+
+    list.innerHTML = faqs.map((f) => `
+      <div class="faq-item">
+        <button class="faq-q" type="button">
+          <span>${esc(f.question)}</span>
+          <span>＋</span>
+        </button>
+        <div class="faq-a">
+          <p>${esc(f.answer).replace(/\n/g, '<br>')}</p>
+        </div>
+      </div>
+    `).join('');
+  };
+
   const docLink = (d) => d.file_url ? `<a class="cms-doc-link" href="${esc(d.file_url)}" target="_blank" rel="noopener">查看文件 →</a>` : '';
   const docMeta = (d) => [d.year, d.quarter].filter(Boolean).join(' · ');
 
@@ -153,6 +178,7 @@
       if (page === 'home') {
         renderHomeBoard(board);
         renderHomeLatest(documents);
+        renderHomeFaq(data.faqs);
       }
 
       document.documentElement.dataset.cmsReady = 'true';
