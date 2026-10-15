@@ -165,6 +165,18 @@ export default {
         );
       }
 
+      // 更換檔案（保留同一筆文件、同一個 /files/{id} 連結）
+      const docFileMatch = path.match(/^\/api\/admin\/documents\/(\d+)\/file$/);
+
+      if (docFileMatch && request.method === "POST") {
+        return replaceDocumentFile(request, env, Number(docFileMatch[1]));
+      }
+
+      // 後台預覽（隱藏文件也看得到）
+      if (docFileMatch && request.method === "GET") {
+        return serveDocumentAdmin(env, Number(docFileMatch[1]));
+      }
+
       if (
         docMatch &&
         request.method === "DELETE"
@@ -1204,6 +1216,72 @@ async function updateDocument(
 }
 
 
+const DOC_EXTENSIONS = new Set(["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "jpg", "jpeg", "png", "webp"]);
+
+// 檢查文件檔案：副檔名、大小、檔頭；回傳 { error } 或 { ext, mimeType, bytes, originalName }
+async function checkDocumentFile(file) {
+  if (!(file instanceof File)) return { error: "請選擇檔案。" };
+  const originalName = clean(file.name, 220);
+  const ext = originalName.includes(".") ? originalName.split(".").pop().toLowerCase() : "";
+  if (!DOC_EXTENSIONS.has(ext)) return { error: "不支援此檔案格式。" };
+  if (file.size > 25 * 1024 * 1024) return { error: "單一檔案上限為 25 MB。" };
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (!fileMatchesExtension(bytes, ext)) return { error: "檔案內容與副檔名不符，請確認檔案是否正確。" };
+  return { ext, mimeType: MIME_BY_EXT[ext] || "application/octet-stream", bytes, originalName };
+}
+
+async function replaceDocumentFile(request, env, id) {
+  const doc = await env.DB.prepare("SELECT id, category, year, file_key FROM documents WHERE id = ?").bind(id).first();
+  if (!doc) return json({ ok: false, message: "找不到這份文件。" }, 404);
+
+  const form = await request.formData();
+  const checked = await checkDocumentFile(form.get("file"));
+  if (checked.error) return json({ ok: false, message: checked.error }, 400);
+
+  const safeYear = /^\d{4}$/.test(doc.year || "") ? doc.year : "other";
+  const key = `${slug(doc.category) || "misc"}/${safeYear}/${Date.now()}-${crypto.randomUUID()}.${checked.ext}`;
+
+  await env.FILES.put(key, checked.bytes, {
+    httpMetadata: { contentType: checked.mimeType },
+    customMetadata: { originalName: checked.originalName }
+  });
+
+  try {
+    await env.DB.prepare(`
+      UPDATE documents
+      SET file_name = ?, file_key = ?, file_size = ?, mime_type = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).bind(checked.originalName, key, checked.bytes.byteLength, checked.mimeType, id).run();
+  } catch (error) {
+    console.error("document file update failed, removing new object:", key, error);
+    await env.FILES.delete(key).catch(() => {});
+    throw error;
+  }
+
+  if (doc.file_key && doc.file_key !== key) {
+    try {
+      await env.FILES.delete(doc.file_key);
+    } catch (error) {
+      console.error("old file delete failed (orphan left):", doc.file_key, error);
+    }
+  }
+
+  return json({ ok: true, message: "檔案已更換，連結不變。" });
+}
+
+async function serveDocumentAdmin(env, id) {
+  const doc = await env.DB.prepare("SELECT file_key, file_name FROM documents WHERE id = ?").bind(id).first();
+  if (!doc?.file_key) return new Response("Not found", { status: 404 });
+  const object = await env.FILES.get(doc.file_key);
+  if (!object) return new Response("Not found", { status: 404 });
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("Cache-Control", "private, no-store");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(doc.file_name || "document")}`);
+  return new Response(object.body, { headers });
+}
+
 async function deleteDocument(
   env,
   id
@@ -1338,9 +1416,10 @@ async function servePublicFile(
   );
 
 
+  // 更換或隱藏文件後要很快生效，不做長時間快取
   headers.set(
     "Cache-Control",
-    "public, max-age=3600"
+    "public, max-age=300"
   );
 
   headers.set(
@@ -3154,6 +3233,19 @@ th{
   }
 }
 
+
+  .dropzone {
+    border: 2px dashed var(--line);
+    border-radius: 14px;
+    padding: 22px;
+    text-align: center;
+    cursor: pointer;
+    background: #fafbff;
+  }
+  .dropzone.drag {
+    border-color: #f08a24;
+    background: #fff6ec;
+  }
 </style>
 
 </head>
@@ -3825,9 +3917,8 @@ th{
 
     <div class="panel">
 
-      <h2>
-        上傳文件
-      </h2>
+      <h2 id="docFormTitle">上傳文件</h2>
+      <div id="docCurrentFile" class="muted" style="margin:-6px 0 12px"></div>
 
       <form
         id="docForm"
@@ -3939,9 +4030,7 @@ th{
 
         <div class="field full">
 
-          <label>
-            標題
-          </label>
+          <label>標題 <span id="docTitleHint" class="muted" style="font-weight:400"></span></label>
 
           <input
             name="title"
@@ -4004,30 +4093,24 @@ th{
 
 
         <div class="field full">
-
-          <label>
-            檔案
-          </label>
-
+          <label>檔案</label>
+          <div id="docDrop" class="dropzone">
+            <div id="docDropText">拖曳檔案到這裡，或點擊選擇（可一次選多個）</div>
+            <div class="muted" style="font-size:13px;margin-top:4px">PDF、Word、Excel、PowerPoint、JPG、PNG、WebP，單檔 25 MB；大張照片會自動壓縮</div>
+            <div id="docFileList" style="margin-top:8px;font-weight:700"></div>
+          </div>
           <input
             name="file"
             type="file"
-            required
+            multiple
+            style="display:none"
             accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.jpg,.jpeg,.png,.webp"
           >
-
         </div>
 
-
-        <div class="field full">
-
-          <button
-            class="btn orange"
-            type="submit"
-          >
-            上傳並發布
-          </button>
-
+        <div class="field full" style="display:flex;gap:10px;flex-direction:row">
+          <button class="btn orange" type="submit" id="docSubmit">上傳並發布</button>
+          <button class="btn ghost" type="button" id="docCancel" style="display:none">取消編輯</button>
         </div>
 
       </form>
@@ -4037,9 +4120,18 @@ th{
 
     <div class="panel">
 
-      <h2>
-        文件列表
-      </h2>
+      <h2>文件列表</h2>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+        <input id="docFilterQ" placeholder="搜尋標題、檔名、說明" style="flex:1;min-width:200px">
+        <select id="docFilterCat" style="width:auto"><option value="">全部分類</option></select>
+        <select id="docFilterYear" style="width:auto"><option value="">全部年度</option></select>
+        <select id="docFilterVis" style="width:auto">
+          <option value="">公開與隱藏</option>
+          <option value="public">只看公開</option>
+          <option value="hidden">只看隱藏</option>
+        </select>
+        <span id="docCount" class="muted"></span>
+      </div>
 
       <div class="table-wrap">
 
@@ -5051,393 +5143,351 @@ async function removeBoard(
 }
 
 
-document
-  .getElementById(
-    "docForm"
-  )
-  .addEventListener(
-    "submit",
-    async function(e) {
+// ===== 圖片壓縮（瀏覽器端，不佔 Worker CPU、免費）=====
+// 長邊縮到 maxSide 以內、重新編碼；壓縮後反而變大就用原檔。順便去掉照片裡的 GPS 等 EXIF。
+async function compressImage(file, opts) {
+  opts = opts || {};
+  var maxSide = opts.maxSide || 2400;
+  var type = opts.type || (file.type === "image/png" ? "image/webp" : file.type === "image/webp" ? "image/webp" : "image/jpeg");
+  var quality = opts.quality || 0.82;
 
-      e.preventDefault();
+  if (["image/jpeg", "image/png", "image/webp"].indexOf(file.type) < 0) return file;
+
+  var bmp;
+  try {
+    bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+  } catch (e) {
+    return file;
+  }
+
+  var scale = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
+  var w = Math.round(bmp.width * scale), h = Math.round(bmp.height * scale);
+
+  // 尺寸本來就小、檔案也小（< 300 KB）就不動
+  if (scale === 1 && file.size < 300 * 1024 && !opts.force) {
+    bmp.close && bmp.close();
+    return file;
+  }
+
+  var canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  var ctx = canvas.getContext("2d");
+  if (type === "image/jpeg") {
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, w, h);
+  }
+  ctx.drawImage(bmp, 0, 0, w, h);
+  bmp.close && bmp.close();
+
+  var blob = await new Promise(function(resolve) { canvas.toBlob(resolve, type, quality); });
+  // 瀏覽器不支援 WebP 編碼時會回傳 PNG，改用 JPEG
+  if (blob && blob.type !== type) {
+    type = "image/jpeg";
+    ctx.globalCompositeOperation = "destination-over";
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, w, h);
+    blob = await new Promise(function(resolve) { canvas.toBlob(resolve, type, quality); });
+  }
+  if (!blob || (blob.size >= file.size && scale === 1)) return file;
+
+  var ext = type === "image/webp" ? ".webp" : ".jpg";
+  var base = baseName(file.name || "image");
+  return new File([blob], base + ext, { type: type });
+}
+
+function baseName(name) {
+  var i = name.lastIndexOf(".");
+  return i > 0 ? name.slice(0, i) : name;
+}
+
+function extOf(name) {
+  var i = name.lastIndexOf(".");
+  return i > 0 ? name.slice(i + 1).toLowerCase() : "";
+}
+
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
+  if (n >= 1024) return Math.round(n / 1024) + " KB";
+  return n + " B";
+}
 
 
-      var btn =
-        e.target.querySelector(
-          "button[type=submit]"
-        );
+// ===== 文件管理 =====
 
+var docState = { editing: 0, files: [] };
+var docForm = document.getElementById("docForm");
+var docFileInput = docForm.querySelector('input[name="file"]');
+var docDrop = document.getElementById("docDrop");
 
+function docSetFiles(list) {
+  docState.files = Array.prototype.slice.call(list || []);
+  if (docState.editing && docState.files.length > 1) docState.files = docState.files.slice(0, 1);
+  var names = docState.files.map(function(f) { return f.name + "（" + fmtSize(f.size) + "）"; });
+  document.getElementById("docFileList").textContent = names.length
+    ? (names.length > 1 ? "已選 " + names.length + " 個檔案：" : "已選：") + names.join("、")
+    : "";
+  var multi = !docState.editing && docState.files.length > 1;
+  document.getElementById("docTitleHint").textContent = multi ? "多檔上傳時，標題留白會用各檔案名稱；有填則全部使用同一個標題加序號。" : "";
+  docForm.querySelector('input[name="title"]').required = !multi && !docState.editing;
+}
+
+docFileInput.addEventListener("change", function() { docSetFiles(docFileInput.files); });
+
+["dragenter", "dragover"].forEach(function(ev) {
+  docDrop.addEventListener(ev, function(e) { e.preventDefault(); docDrop.classList.add("drag"); });
+});
+["dragleave", "drop"].forEach(function(ev) {
+  docDrop.addEventListener(ev, function(e) { e.preventDefault(); docDrop.classList.remove("drag"); });
+});
+docDrop.addEventListener("drop", function(e) { docSetFiles(e.dataTransfer.files); });
+docDrop.addEventListener("click", function() { docFileInput.click(); });
+
+async function prepareDocFile(f) {
+  // 文件裡的圖片：保持原格式（避免副檔名改變），只縮尺寸、重新壓縮；PNG 不動
+  var ext = extOf(f.name);
+  if ((ext === "jpg" || ext === "jpeg" || ext === "webp") && f.size > 300 * 1024) {
+    var type = ext === "webp" ? "image/webp" : "image/jpeg";
+    var c = await compressImage(f, { maxSide: 3000, type: type, quality: 0.85 });
+    if (c !== f) return new File([c], f.name, { type: type });
+  }
+  return f;
+}
+
+function docFields() {
+  var fd = new FormData(docForm);
+  return {
+    category: fd.get("category"),
+    subcategory: fd.get("subcategory") || "",
+    year: fd.get("year") || "",
+    quarter: fd.get("quarter") || "",
+    title: (fd.get("title") || "").trim(),
+    description: fd.get("description") || "",
+    sort_order: Number(fd.get("sort_order")) || 0,
+    is_public: fd.get("is_public") !== "false"
+  };
+}
+
+docForm.addEventListener("submit", async function(e) {
+  e.preventDefault();
+  var btn = document.getElementById("docSubmit");
+  var f = docFields();
+
+  try {
+    btn.disabled = true;
+
+    if (docState.editing) {
+      btn.textContent = "儲存中…";
+      if (!f.title) throw new Error("標題不可空白。");
+      await api("/api/admin/documents/" + docState.editing, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(f)
+      });
+      if (docState.files.length) {
+        btn.textContent = "更換檔案中…";
+        var rf = new FormData();
+        rf.append("file", await prepareDocFile(docState.files[0]));
+        await api("/api/admin/documents/" + docState.editing + "/file", { method: "POST", body: rf });
+      }
+      flash(docState.files.length ? "文件資料已更新，檔案已更換（連結不變）。" : "文件資料已更新。");
+      docCancelEdit();
+      await load();
+      return;
+    }
+
+    if (!docState.files.length) throw new Error("請選擇檔案。");
+    var total = docState.files.length, done = 0, failed = [];
+
+    for (var i = 0; i < total; i++) {
+      var file = docState.files[i];
+      btn.textContent = "上傳中 " + (i + 1) + "/" + total + "…";
+      var fd = new FormData();
+      var title = total === 1
+        ? f.title
+        : (f.title ? f.title + "（" + (i + 1) + "）" : baseName(file.name));
+      fd.append("category", f.category);
+      fd.append("subcategory", f.subcategory);
+      fd.append("year", f.year);
+      fd.append("quarter", f.quarter);
+      fd.append("title", title);
+      fd.append("description", f.description);
+      fd.append("sort_order", String(f.sort_order + i));
+      fd.append("is_public", f.is_public ? "true" : "false");
+      fd.append("file", await prepareDocFile(file));
       try {
-
-        btn.disabled =
-          true;
-
-
-        btn.textContent =
-          "上傳中…";
-
-
-        await api(
-          "/api/admin/documents",
-          {
-            method: "POST",
-
-            body:
-              new FormData(
-                e.target
-              )
-          }
-        );
-
-
-        e.target.reset();
-
-
-        flash(
-          "文件已上傳。"
-        );
-
-
-        await load();
-
+        await api("/api/admin/documents", { method: "POST", body: fd });
+        done++;
       } catch (err) {
-
-        flash(
-          err.message,
-          false
-        );
-
-      } finally {
-
-        btn.disabled =
-          false;
-
-
-        btn.textContent =
-          "上傳並發布";
+        failed.push(file.name + "：" + err.message);
       }
     }
-  );
 
+    if (failed.length) {
+      flash("已上傳 " + done + " 個，失敗 " + failed.length + " 個：" + failed.join("；"), false);
+    } else {
+      flash(total > 1 ? "已上傳 " + total + " 個文件。" : "文件已上傳。");
+    }
+    docForm.reset();
+    docSetFiles([]);
+    await load();
+  } catch (err) {
+    flash(err.message, false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = docState.editing ? "儲存修改" : "上傳並發布";
+  }
+});
+
+function editDoc(id) {
+  var d = (state.documents || []).find(function(x) { return x.id === id; });
+  if (!d) return;
+  docState.editing = id;
+  var el = docForm.elements;
+  var cat = el.category;
+  if (!Array.prototype.some.call(cat.options, function(o) { return o.value === d.category; })) {
+    var o = document.createElement("option");
+    o.textContent = d.category;
+    cat.appendChild(o);
+  }
+  cat.value = d.category;
+  el.subcategory.value = d.subcategory || "";
+  el.year.value = d.year || "";
+  el.quarter.value = d.quarter || "";
+  el.title.value = d.title || "";
+  el.description.value = d.description || "";
+  el.sort_order.value = d.sort_order || 0;
+  el.is_public.value = d.is_public ? "true" : "false";
+  docFileInput.value = "";
+  docFileInput.multiple = false;
+  docSetFiles([]);
+  document.getElementById("docFormTitle").textContent = "編輯文件 #" + id;
+  document.getElementById("docCurrentFile").innerHTML =
+    "目前檔案：" + esc(d.file_name || "") + "（" + fmtSize(d.file_size) + "）　" +
+    '<a href="/api/admin/documents/' + id + '/file" target="_blank">預覽</a>　' +
+    '<span class="muted">要更換檔案再選新檔；前台連結不會變。</span>';
+  document.getElementById("docDropText").textContent = "拖曳新檔案到這裡，或點擊選擇（選填）";
+  document.getElementById("docSubmit").textContent = "儲存修改";
+  document.getElementById("docCancel").style.display = "";
+  docForm.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function docCancelEdit() {
+  docState.editing = 0;
+  docForm.reset();
+  docFileInput.multiple = true;
+  docSetFiles([]);
+  document.getElementById("docFormTitle").textContent = "上傳文件";
+  document.getElementById("docCurrentFile").innerHTML = "";
+  document.getElementById("docDropText").textContent = "拖曳檔案到這裡，或點擊選擇（可一次選多個）";
+  document.getElementById("docSubmit").textContent = "上傳並發布";
+  document.getElementById("docCancel").style.display = "none";
+}
+
+document.getElementById("docCancel").addEventListener("click", docCancelEdit);
 
 function renderDocs() {
+  var docs = state.documents || [];
+  var fq = document.getElementById("docFilterQ").value.trim().toLowerCase();
+  var fc = document.getElementById("docFilterCat").value;
+  var fy = document.getElementById("docFilterYear").value;
+  var fv = document.getElementById("docFilterVis").value;
 
-  var tbody =
-    document.getElementById(
-      "docRows"
-    );
+  // 篩選選項依現有資料產生
+  var cats = {}, years = {};
+  docs.forEach(function(d) { cats[d.category] = 1; if (d.year) years[d.year] = 1; });
+  fillFilter("docFilterCat", Object.keys(cats).sort(), "全部分類");
+  fillFilter("docFilterYear", Object.keys(years).sort().reverse(), "全部年度");
 
+  var list = docs.filter(function(d) {
+    if (fc && d.category !== fc) return false;
+    if (fy && d.year !== fy) return false;
+    if (fv === "public" && !d.is_public) return false;
+    if (fv === "hidden" && d.is_public) return false;
+    if (fq) {
+      var hay = [d.title, d.subcategory, d.description, d.file_name, d.category].join(" ").toLowerCase();
+      if (hay.indexOf(fq) < 0) return false;
+    }
+    return true;
+  });
 
-  tbody.innerHTML =
-    "";
+  document.getElementById("docCount").textContent = "共 " + docs.length + " 份，顯示 " + list.length + " 份";
 
+  var tbody = document.getElementById("docRows");
+  tbody.innerHTML = list.length ? "" : '<tr><td colspan="6" class="muted">沒有符合的文件。</td></tr>';
 
-  (
-    state.documents ||
-    []
-  )
-    .forEach(
-      function(d) {
+  list.forEach(function(d) {
+    var tr = document.createElement("tr");
+    tr.innerHTML =
+      "<td>" + esc(d.category) + '<br><span class="muted">' + esc(d.subcategory || "") + "</span></td>" +
+      "<td>" + esc((d.year || "") + " " + (d.quarter || "")) + "</td>" +
+      "<td><strong>" + esc(d.title) + "</strong>" +
+        '<div class="muted">更新：' + esc(twTime(d.updated_at || d.created_at || d.published_at)) + "</div></td>" +
+      '<td><a href="/api/admin/documents/' + d.id + '/file" target="_blank">' + esc(d.file_name || "檔案") + "</a>" +
+        '<div class="muted">' + fmtSize(d.file_size) + "</div></td>" +
+      '<td><span class="badge">' + (d.is_public ? "公開" : "隱藏") + "</span>" +
+        (d.is_public ? '<div><a class="muted" href="/files/' + d.id + '" target="_blank">前台連結</a></div>' : "") + "</td>" +
+      "<td>" +
+        '<button class="btn ghost" type="button" data-edit-doc="' + d.id + '">編輯</button> ' +
+        '<button class="btn ghost" type="button" data-toggle-doc="' + d.id + '">' + (d.is_public ? "隱藏" : "公開") + "</button> " +
+        '<button class="btn danger" type="button" data-delete-doc="' + d.id + '">刪除</button>' +
+      "</td>";
+    tbody.appendChild(tr);
+  });
 
-        var tr =
-          document.createElement(
-            "tr"
-          );
-
-
-        var fileLink =
-          d.is_public
-            ? (
-              "<a href=\\\"/files/" +
-              d.id +
-              "\\\" target=\\\"_blank\\\">查看檔案</a>"
-            )
-            : (
-              "<span class=\\\"muted\\\">隱藏文件</span>"
-            );
-
-
-        tr.innerHTML =
-          "<td>" +
-          esc(
-            d.category
-          ) +
-
-          "<br><span class=\\\"muted\\\">" +
-          esc(
-            d.subcategory ||
-            ""
-          ) +
-          "</span></td>" +
-
-          "<td>" +
-          esc(
-            (
-              d.year ||
-              ""
-            ) +
-            " " +
-            (
-              d.quarter ||
-              ""
-            )
-          ) +
-          "</td>" +
-
-          "<td><strong>" +
-          esc(
-            d.title
-          ) +
-          "</strong></td>" +
-
-          "<td>" +
-          fileLink +
-          "</td>" +
-
-          "<td><span class=\\\"badge\\\">" +
-          (
-            d.is_public
-              ? "公開"
-              : "隱藏"
-          ) +
-          "</span></td>" +
-
-          "<td>" +
-
-          "<button class=\\\"btn ghost\\\" data-edit-doc=\\\"" +
-          d.id +
-          "\\\">編輯</button> " +
-
-          "<button class=\\\"btn danger\\\" data-delete-doc=\\\"" +
-          d.id +
-          "\\\">刪除</button>" +
-
-          "</td>";
-
-
-        tbody.appendChild(
-          tr
-        );
-      }
-    );
-
-
-  tbody
-    .querySelectorAll(
-      "[data-edit-doc]"
-    )
-    .forEach(
-      function(btn) {
-
-        btn.onclick =
-          function() {
-
-            editDoc(
-              Number(
-                btn.dataset.editDoc
-              )
-            );
-          };
-      }
-    );
-
-
-  tbody
-    .querySelectorAll(
-      "[data-delete-doc]"
-    )
-    .forEach(
-      function(btn) {
-
-        btn.onclick =
-          function() {
-
-            removeDoc(
-              Number(
-                btn.dataset.deleteDoc
-              )
-            );
-          };
-      }
-    );
+  tbody.querySelectorAll("[data-edit-doc]").forEach(function(btn) {
+    btn.onclick = function() { editDoc(Number(btn.dataset.editDoc)); };
+  });
+  tbody.querySelectorAll("[data-toggle-doc]").forEach(function(btn) {
+    btn.onclick = function() { toggleDoc(Number(btn.dataset.toggleDoc)); };
+  });
+  tbody.querySelectorAll("[data-delete-doc]").forEach(function(btn) {
+    btn.onclick = function() { removeDoc(Number(btn.dataset.deleteDoc)); };
+  });
 }
 
+function fillFilter(id, values, allLabel) {
+  var sel = document.getElementById(id);
+  var cur = sel.value;
+  sel.innerHTML = '<option value="">' + allLabel + "</option>" +
+    values.map(function(v) { return '<option value="' + escAttr(v) + '">' + esc(v) + "</option>"; }).join("");
+  if (values.indexOf(cur) >= 0) sel.value = cur;
+}
 
-async function editDoc(
-  id
-) {
+["docFilterQ", "docFilterCat", "docFilterYear", "docFilterVis"].forEach(function(id) {
+  document.getElementById(id).addEventListener(id === "docFilterQ" ? "input" : "change", renderDocs);
+});
 
-  var d =
-    (
-      state.documents ||
-      []
-    )
-      .find(
-        function(x) {
-          return x.id === id;
-        }
-      );
-
-
-  if (!d) {
-    return;
-  }
-
-
-  var title =
-    prompt(
-      "標題",
-      d.title
-    );
-
-
-  if (
-    title === null
-  ) {
-    return;
-  }
-
-
-  var year =
-    prompt(
-      "年度",
-      d.year ||
-      ""
-    );
-
-
-  if (
-    year === null
-  ) {
-    return;
-  }
-
-
-  var quarter =
-    prompt(
-      "季度",
-      d.quarter ||
-      ""
-    );
-
-
-  if (
-    quarter === null
-  ) {
-    return;
-  }
-
-
-  var pub =
-    confirm(
-      "按「確定」設為公開；按「取消」設為隱藏。"
-    );
-
-
+async function toggleDoc(id) {
+  var d = (state.documents || []).find(function(x) { return x.id === id; });
+  if (!d) return;
   try {
-
-    await api(
-      "/api/admin/documents/" +
-      id,
-      {
-        method:
-          "PUT",
-
-        headers: {
-          "Content-Type":
-            "application/json"
-        },
-
-        body:
-          JSON.stringify({
-
-            category:
-              d.category,
-
-            subcategory:
-              d.subcategory ||
-              "",
-
-            year:
-              year,
-
-            quarter:
-              quarter,
-
-            title:
-              title,
-
-            description:
-              d.description ||
-              "",
-
-            sort_order:
-              d.sort_order ||
-              0,
-
-            is_public:
-              pub
-          })
-      }
-    );
-
-
-    flash(
-      "文件資料已更新。"
-    );
-
-
+    await api("/api/admin/documents/" + id, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        category: d.category, subcategory: d.subcategory || "", year: d.year || "", quarter: d.quarter || "",
+        title: d.title, description: d.description || "", sort_order: d.sort_order || 0, is_public: !d.is_public
+      })
+    });
+    flash(d.is_public ? "已隱藏（前台約 5 分鐘內完全消失）。" : "已公開。");
     await load();
-
   } catch (err) {
-
-    flash(
-      err.message,
-      false
-    );
+    flash(err.message, false);
   }
 }
 
-
-async function removeDoc(
-  id
-) {
-
-  if (
-    !confirm(
-      "確定刪除此文件？R2 檔案也會一起刪除。"
-    )
-  ) {
-    return;
-  }
-
-
+async function removeDoc(id) {
+  var d = (state.documents || []).find(function(x) { return x.id === id; });
+  if (!confirm("確定刪除「" + (d ? d.title : "#" + id) + "」？檔案也會一起刪除（每日備份裡仍保留副本）。")) return;
   try {
-
-    await api(
-      "/api/admin/documents/" +
-      id,
-      {
-        method:
-          "DELETE"
-      }
-    );
-
-
-    flash(
-      "文件已刪除。"
-    );
-
-
+    await api("/api/admin/documents/" + id, { method: "DELETE" });
+    if (docState.editing === id) docCancelEdit();
+    flash("文件已刪除。");
     await load();
-
   } catch (err) {
-
-    flash(
-      err.message,
-      false
-    );
+    flash(err.message, false);
   }
 }
 
@@ -5772,8 +5822,19 @@ document.getElementById("pageImageInput").addEventListener("change", async funct
   var t = pageEditor.imageTarget;
   if (!file || !t) return;
 
+  // 上傳前在瀏覽器壓縮：背景大圖長邊 2400、一般圖片 1600、分享圖 1200（用 JPEG，各平台都支援）
+  var original = file.size;
+  try {
+    flash("圖片處理中…");
+    file = t.kind === "seo"
+      ? await compressImage(file, { maxSide: 1200, type: "image/jpeg", quality: 0.85, force: true })
+      : await compressImage(file, { maxSide: t.kind === "img" ? 1600 : 2400 });
+  } catch (err) {
+    console.warn("compress failed", err);
+  }
+
   if (file.size > 5 * 1024 * 1024) {
-    flash("圖片上限為 5 MB。", false);
+    flash("圖片壓縮後仍超過 5 MB，請換一張。", false);
     return;
   }
 
@@ -5796,7 +5857,7 @@ document.getElementById("pageImageInput").addEventListener("change", async funct
 
     pageEditor.dirty[t.key] = { type: "image", value: data.url };
     updatePageToolbar();
-    flash("圖片已上傳，按「儲存並上線」後生效。");
+    flash("圖片已上傳" + (file.size < original ? "（" + fmtSize(original) + " → " + fmtSize(file.size) + "）" : "") + "，按「儲存並上線」後生效。");
   } catch (err) {
     flash(err.message, false);
   }
