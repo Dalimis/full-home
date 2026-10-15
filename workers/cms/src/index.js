@@ -1745,6 +1745,16 @@ async function loadSiteContent(env) {
 }
 
 const CONTENT_KEY_RE = /^[a-z0-9]+(?:[.-][a-z0-9]+)*$/;
+
+// SEO 與分享預覽欄位的長度上限
+const SEO_MAX = {
+  "seo.title": 80,
+  "seo.description": 300,
+  "seo.og-title": 80,
+  "seo.og-description": 300
+};
+
+const SITE_ORIGIN = "https://www.full-home.com.tw";
 const MEDIA_URL_RE = /^\/media\/[a-z0-9-]+\.(?:png|jpe?g|webp)$/;
 
 // 只允許少數行內標籤，且不保留任何屬性
@@ -1792,6 +1802,11 @@ async function saveSiteContent(request, env, me) {
       type = "text";
       value = sanitizeInlineHtml(c.value);
       if (!value) return json({ ok: false, message: `「${key}」不可空白；要恢復原文請用「還原預設」。` }, 400);
+    } else if (c.type === "plain") {
+      // SEO 標題/描述：純文字，不允許任何 HTML
+      type = "plain";
+      value = String(c.value ?? "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim().slice(0, SEO_MAX[key] || 300);
+      if (!value) return json({ ok: false, message: `「${key}」不可空白；要恢復預設請用「還原預設」。` }, 400);
     } else if (c.type === "image") {
       type = "image";
       value = String(c.value || "");
@@ -1854,6 +1869,26 @@ async function serveMedia(path, env) {
   return new Response(object.body, { headers });
 }
 
+// 分享標題/描述沒有另外設定時，沿用網頁標題/描述
+function seoValue(content, field) {
+  const pick = (key, type) => {
+    const c = content.get(key);
+    return c && c.type === type ? c.value : null;
+  };
+
+  switch (field) {
+    case "title": return pick("seo.title", "plain");
+    case "description": return pick("seo.description", "plain");
+    case "og-title": return pick("seo.og-title", "plain") ?? pick("seo.title", "plain");
+    case "og-description": return pick("seo.og-description", "plain") ?? pick("seo.description", "plain");
+    case "og-image": {
+      const v = pick("seo.og-image", "image");
+      return v ? SITE_ORIGIN + v : null;
+    }
+    default: return null;
+  }
+}
+
 async function renderHomepage(request, env) {
   // 不帶快取條件去拿原始 HTML，避免 304 讓瀏覽器沿用舊內容
   const headers = new Headers(request.headers);
@@ -1894,6 +1929,18 @@ async function renderHomepage(request, env) {
       element(el) {
         const v = get(el, "data-edit-bg", "image");
         if (v !== null) el.setAttribute("style", `--edit-bg:url("${v}")`);
+      }
+    })
+    .on("title[data-seo]", {
+      element(el) {
+        const v = seoValue(content, "title");
+        if (v !== null) el.setInnerContent(v);
+      }
+    })
+    .on("meta[data-seo]", {
+      element(el) {
+        const v = seoValue(content, el.getAttribute("data-seo"));
+        if (v !== null) el.setAttribute("content", v);
       }
     })
     .transform(origin);
@@ -2668,6 +2715,12 @@ th{
   font-size:13px;
 }
 
+.seo-grid{
+  display:grid;
+  grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);
+  gap:24px;
+}
+
 .count-grid{
   display:grid;
   grid-template-columns:
@@ -2712,6 +2765,7 @@ th{
     padding:20px;
   }
 
+  .seo-grid,
   .grid2,
   .count-grid{
     grid-template-columns:
@@ -3761,6 +3815,68 @@ th{
       </div>
       <div id="pageSelected" class="muted" style="margin-top:8px">尚未選取區塊</div>
       <input type="file" id="pageImageInput" accept="image/jpeg,image/png,image/webp" style="display:none">
+    </div>
+
+    <div class="panel" id="seoPanel">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+        <h2 style="margin:0">SEO 與分享預覽</h2>
+        <button class="btn ghost" type="button" id="seoToggle">展開設定</button>
+      </div>
+
+      <div id="seoBody" style="display:none;margin-top:16px">
+        <div class="seo-grid">
+
+          <div class="grid2" style="grid-template-columns:1fr">
+            <div class="field">
+              <label>網頁標題（Google 搜尋結果、瀏覽器分頁）<span class="muted" data-seo-count="seo.title"></span></label>
+              <input data-seo-field="seo.title" maxlength="80">
+            </div>
+            <div class="field">
+              <label>搜尋描述（Google 搜尋結果的說明文字）<span class="muted" data-seo-count="seo.description"></span></label>
+              <textarea data-seo-field="seo.description" maxlength="300" style="min-height:80px"></textarea>
+            </div>
+            <div class="field">
+              <label>分享標題（LINE / Facebook，留空則同網頁標題）<span class="muted" data-seo-count="seo.og-title"></span></label>
+              <input data-seo-field="seo.og-title" maxlength="80" placeholder="與網頁標題相同">
+            </div>
+            <div class="field">
+              <label>分享描述（留空則同搜尋描述）<span class="muted" data-seo-count="seo.og-description"></span></label>
+              <textarea data-seo-field="seo.og-description" maxlength="300" style="min-height:70px" placeholder="與搜尋描述相同"></textarea>
+            </div>
+            <div class="field">
+              <label>分享圖片（建議 1200 × 630，JPG / PNG / WebP，5 MB 以內）</label>
+              <div class="actions" style="margin-top:0">
+                <button class="btn ghost" type="button" id="seoImageBtn">上傳分享圖片</button>
+                <button class="btn ghost" type="button" id="seoImageReset">還原預設圖片</button>
+              </div>
+              <div id="seoImageHint" class="muted"></div>
+            </div>
+            <p class="muted" style="margin:0">
+              修改後按上方「儲存並上線」。Facebook / LINE 會快取舊的預覽，上線後可到
+              Facebook 分享偵錯工具按「重新抓取」更新。
+            </p>
+          </div>
+
+          <div>
+            <label>分享預覽</label>
+            <div style="border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#fff;margin-top:6px">
+              <div style="aspect-ratio:1.91/1;background:#e9ebf3 center/cover no-repeat" id="seoPreviewImg"></div>
+              <div style="padding:12px 14px;background:#f2f3f5">
+                <div class="muted" style="font-size:12px;letter-spacing:.04em">WWW.FULL-HOME.COM.TW</div>
+                <div id="seoPreviewTitle" style="font-weight:800;margin:4px 0;line-height:1.35"></div>
+                <div id="seoPreviewDesc" class="muted" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden"></div>
+              </div>
+            </div>
+            <label style="display:block;margin-top:16px">Google 搜尋預覽</label>
+            <div style="border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:#fff;margin-top:6px">
+              <div class="muted" style="font-size:12px">https://www.full-home.com.tw</div>
+              <div id="seoGoogleTitle" style="color:#1a0dab;font-size:18px;margin:2px 0"></div>
+              <div id="seoGoogleDesc" style="font-size:13px;color:#4d5156;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden"></div>
+            </div>
+          </div>
+
+        </div>
+      </div>
     </div>
 
     <div class="panel" style="padding:0;overflow:hidden">
@@ -5172,6 +5288,8 @@ function setupPageFrame() {
   }, true);
 
   doc.addEventListener("submit", function(e) { e.preventDefault(); }, true);
+
+  fillSeoForm(doc);
 }
 
 function activatePageText(el) {
@@ -5240,6 +5358,10 @@ document.getElementById("pageImageInput").addEventListener("change", async funct
 
     if (t.kind === "img") {
       t.el.setAttribute("src", data.url);
+    } else if (t.kind === "seo") {
+      seoState.image = data.url;
+      document.getElementById("seoImageHint").textContent = "已上傳新的分享圖片，儲存後生效";
+      updateSeoPreview();
     } else {
       t.el.style.setProperty("--edit-bg", "url(" + JSON.stringify(data.url) + ")");
     }
@@ -5521,6 +5643,118 @@ document.getElementById("backupRun").addEventListener("click", async function() 
 
 document.getElementById("backupRefresh").addEventListener("click", loadBackups);
 document.querySelector('.nav button[data-target="backups"]').addEventListener("click", loadBackups);
+
+
+// ===== SEO 與分享預覽 =====
+
+var SEO_LIMIT = { "seo.title": 60, "seo.description": 160, "seo.og-title": 60, "seo.og-description": 160 };
+var seoState = { defaults: {}, image: "" };
+
+document.getElementById("seoToggle").addEventListener("click", function() {
+  var body = document.getElementById("seoBody");
+  var open = body.style.display === "none";
+  body.style.display = open ? "" : "none";
+  this.textContent = open ? "收合設定" : "展開設定";
+});
+
+function seoMeta(doc, selector) {
+  var el = doc.querySelector(selector);
+  return el ? (el.getAttribute("content") || "") : "";
+}
+
+// iframe 載入後，從實際渲染出來的首頁讀取目前的 SEO 值
+function fillSeoForm(doc) {
+  var keys = state.content_keys || [];
+  var title = doc.title || "";
+  var desc = seoMeta(doc, 'meta[name="description"]');
+  var ogTitle = seoMeta(doc, 'meta[property="og:title"]');
+  var ogDesc = seoMeta(doc, 'meta[property="og:description"]');
+
+  seoState.image = seoMeta(doc, 'meta[property="og:image"]');
+
+  setSeoField("seo.title", title);
+  setSeoField("seo.description", desc);
+  setSeoField("seo.og-title", keys.indexOf("seo.og-title") >= 0 ? ogTitle : "");
+  setSeoField("seo.og-description", keys.indexOf("seo.og-description") >= 0 ? ogDesc : "");
+
+  document.getElementById("seoImageHint").textContent =
+    keys.indexOf("seo.og-image") >= 0 ? "目前使用：自訂分享圖片" : "目前使用：預設圖片（首頁主視覺）";
+
+  updateSeoPreview();
+}
+
+function setSeoField(key, value) {
+  var el = document.querySelector('[data-seo-field="' + key + '"]');
+  el.value = value;
+  el.dataset.original = value;
+}
+
+function seoVal(key) {
+  return document.querySelector('[data-seo-field="' + key + '"]').value.trim();
+}
+
+function updateSeoPreview() {
+  var title = seoVal("seo.og-title") || seoVal("seo.title");
+  var desc = seoVal("seo.og-description") || seoVal("seo.description");
+
+  document.getElementById("seoPreviewTitle").textContent = title;
+  document.getElementById("seoPreviewDesc").textContent = desc;
+  document.getElementById("seoGoogleTitle").textContent = seoVal("seo.title");
+  document.getElementById("seoGoogleDesc").textContent = seoVal("seo.description");
+  document.getElementById("seoPreviewImg").style.backgroundImage =
+    seoState.image ? "url(" + JSON.stringify(seoState.image) + ")" : "none";
+
+  Object.keys(SEO_LIMIT).forEach(function(k) {
+    var n = seoVal(k).length;
+    var span = document.querySelector('[data-seo-count="' + k + '"]');
+    span.textContent = "　" + n + " / 建議 " + SEO_LIMIT[k] + " 字內";
+    span.style.color = n > SEO_LIMIT[k] ? "#a22" : "";
+  });
+}
+
+document.querySelectorAll("[data-seo-field]").forEach(function(el) {
+  el.addEventListener("input", function() {
+    var key = el.dataset.seoField;
+    var v = el.value.trim();
+    var overridden = (state.content_keys || []).indexOf(key) >= 0;
+
+    if (v === (el.dataset.original || "").trim()) {
+      delete pageEditor.dirty[key];
+    } else if (!v) {
+      if (key === "seo.title" || key === "seo.description") {
+        // 標題、描述不能空白：清空代表還原成網站原本的內容
+        pageEditor.dirty[key] = overridden ? null : undefined;
+        if (pageEditor.dirty[key] === undefined) delete pageEditor.dirty[key];
+      } else {
+        if (overridden) pageEditor.dirty[key] = null; else delete pageEditor.dirty[key];
+      }
+    } else {
+      pageEditor.dirty[key] = { type: "plain", value: v };
+    }
+
+    updatePageToolbar();
+    updateSeoPreview();
+  });
+});
+
+document.getElementById("seoImageBtn").addEventListener("click", function() {
+  pageEditor.imageTarget = { key: "seo.og-image", el: null, kind: "seo" };
+  var input = document.getElementById("pageImageInput");
+  input.value = "";
+  input.click();
+});
+
+document.getElementById("seoImageReset").addEventListener("click", function() {
+  if ((state.content_keys || []).indexOf("seo.og-image") < 0 && !pageEditor.dirty["seo.og-image"]) {
+    flash("目前已經是預設圖片。");
+    return;
+  }
+  pageEditor.dirty["seo.og-image"] = null;
+  seoState.image = "";
+  document.getElementById("seoImageHint").textContent = "儲存後將還原為預設圖片";
+  updatePageToolbar();
+  updateSeoPreview();
+});
 
 
 // ===== 常見問題 =====
