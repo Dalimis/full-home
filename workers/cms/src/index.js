@@ -255,6 +255,10 @@ export default {
         return downloadBackup(url, env);
       }
 
+      if (path === "/api/admin/dashboard" && request.method === "GET") {
+        return adminDashboard(env, me);
+      }
+
       // ===== 頁面內容 =====
       if (path === "/api/admin/content/lock" && request.method === "GET") {
         return getLock(env, me);
@@ -2652,6 +2656,258 @@ async function releaseLock(env, me) {
   return json({ ok: true });
 }
 
+// ===== 儀表板：依登入者的權限彙整各模組狀態 =====
+
+// 搜尋結果顯示寬度：中日韓文字算 2、英數算 1（Google 標題約 60、描述約 160 個單位會被截斷）
+function displayWidth(text) {
+  let w = 0;
+  for (const ch of String(text || "")) w += /[⺀-鿿가-힯豈-﫿＀-￯]/.test(ch) ? 2 : 1;
+  return w;
+}
+
+function htmlMeta(html, re) {
+  const m = html.match(re);
+  return m ? m[1].replace(/&amp;/g, "&").replace(/&quot;/g, '"').trim() : "";
+}
+
+async function seoStatus(env, content) {
+  let html = "";
+  try {
+    const r = await fetch(SITE_ORIGIN + "/", { headers: { "User-Agent": "fullhome-dashboard" } });
+    html = await r.text();
+  } catch (error) {
+    console.error("seo status fetch failed:", error);
+  }
+
+  const title = seoValue(content, "title") || htmlMeta(html, /<title[^>]*>([^<]*)<\/title>/i);
+  const desc = seoValue(content, "description") || htmlMeta(html, /<meta[^>]*name="description"[^>]*content="([^"]*)"/i);
+  const ogImage = seoValue(content, "og-image") || htmlMeta(html, /<meta[^>]*property="og:image"[^>]*content="([^"]*)"/i);
+  const tw = displayWidth(title);
+  const dw = displayWidth(desc);
+
+  const checks = [
+    {
+      label: "網頁標題長度",
+      value: title,
+      detail: `約 ${tw} 個單位（建議 20–60，中文一字算 2）`,
+      level: !title ? "critical" : tw > 60 ? "warning" : tw < 20 ? "warning" : "good",
+      hint: tw > 60 ? "太長，Google 會截斷後半段" : tw < 20 ? "太短，可以加上主要服務關鍵字" : ""
+    },
+    {
+      label: "搜尋描述長度",
+      value: desc,
+      detail: `約 ${dw} 個單位（建議 80–160）`,
+      level: !desc ? "critical" : dw > 160 ? "warning" : dw < 80 ? "warning" : "good",
+      hint: !desc ? "沒有描述，Google 會自己抓頁面文字" : dw > 160 ? "太長，會被截斷" : dw < 80 ? "偏短，可以多寫服務地區與特色" : ""
+    },
+    {
+      label: "分享圖片",
+      value: ogImage,
+      detail: content.has("seo.og-image") ? "使用自訂分享圖" : "使用預設分享圖（Logo + 標語）",
+      level: ogImage ? "good" : "warning",
+      hint: ""
+    },
+    {
+      label: "標準網址（canonical）",
+      value: "",
+      detail: /rel="canonical"/.test(html) ? "已設定 https://www.full-home.com.tw/" : "未設定",
+      level: /rel="canonical"/.test(html) ? "good" : "warning",
+      hint: ""
+    },
+    {
+      label: "sitemap.xml / robots.txt",
+      value: "",
+      detail: "系統自動產生，依後台資料更新日期",
+      level: "good",
+      hint: ""
+    },
+    {
+      label: "結構化資料（公司資訊）",
+      value: "",
+      detail: /application\/ld\+json/.test(html) ? "已設定 Organization" : "未設定",
+      level: /application\/ld\+json/.test(html) ? "good" : "warning",
+      hint: ""
+    }
+  ];
+
+  const passed = checks.filter((c) => c.level === "good").length;
+  return { score: Math.round((passed / checks.length) * 100), passed, total: checks.length, checks };
+}
+
+async function adminDashboard(env, me) {
+  const can = (p) => me.permissions.includes(p);
+  const out = { ok: true, generated_at: new Date().toISOString(), alerts: [] };
+  const alert = (level, text, target) => out.alerts.push({ level, text, target });
+
+  // ---- 聯絡表單 ----
+  if (can("contacts")) {
+    try {
+      await ensureContactTable(env);
+      const one = (sql) => env.DB.prepare(sql).first();
+      const byStatus = (await env.DB.prepare("SELECT status, COUNT(*) AS n FROM contact_submissions GROUP BY status").all()).results || [];
+      const counts = { new: 0, contacted: 0, closed: 0, spam: 0 };
+      for (const r of byStatus) counts[r.status] = r.n;
+
+      const tw = "'+8 hours'";
+      const thisMonth = await one(`SELECT COUNT(*) AS n FROM contact_submissions WHERE strftime('%Y-%m', created_at, ${tw}) = strftime('%Y-%m', 'now', ${tw}) AND status != 'spam'`);
+      const lastMonth = await one(`SELECT COUNT(*) AS n FROM contact_submissions WHERE strftime('%Y-%m', created_at, ${tw}) = strftime('%Y-%m', 'now', ${tw}, 'start of month', '-1 month') AND status != 'spam'`);
+      const oldestNew = await one("SELECT MIN(created_at) AS t FROM contact_submissions WHERE status = 'new'");
+      const mailFailed = await one("SELECT COUNT(*) AS n FROM contact_submissions WHERE mail_status = 'failed' AND created_at >= datetime('now', '-7 days')");
+
+      const daily = (await env.DB.prepare(`
+        SELECT date(created_at, ${tw}) AS d, COUNT(*) AS n
+        FROM contact_submissions
+        WHERE created_at >= datetime('now', '-31 days') AND status != 'spam'
+        GROUP BY d
+      `).all()).results || [];
+      const dayMap = new Map(daily.map((r) => [r.d, r.n]));
+      const days = [];
+      const now = Date.now() + 8 * 3600 * 1000;
+      for (let i = 29; i >= 0; i--) {
+        const d = new Date(now - i * 86400000).toISOString().slice(0, 10);
+        days.push({ date: d, count: dayMap.get(d) || 0 });
+      }
+
+      const top = async (col) => ((await env.DB.prepare(`
+        SELECT COALESCE(NULLIF(TRIM(${col}), ''), '未填') AS label, COUNT(*) AS n
+        FROM contact_submissions
+        WHERE created_at >= datetime('now', '-90 days') AND status != 'spam'
+        GROUP BY label ORDER BY n DESC LIMIT 5
+      `).all()).results || []);
+
+      const latest = (await env.DB.prepare(`
+        SELECT id, created_at, name, city, type, status
+        FROM contact_submissions WHERE status != 'spam'
+        ORDER BY created_at DESC, id DESC LIMIT 6
+      `).all()).results || [];
+
+      out.contacts = {
+        counts,
+        this_month: thisMonth.n,
+        last_month: lastMonth.n,
+        mail_failed_7d: mailFailed.n,
+        oldest_new: oldestNew.t,
+        days,
+        cities: await top("city"),
+        types: await top("type"),
+        latest
+      };
+
+      if (counts.new) {
+        const ageDays = oldestNew.t ? (Date.now() - new Date(oldestNew.t.replace(" ", "T") + "Z").getTime()) / 86400000 : 0;
+        alert(ageDays > 3 ? "serious" : "warning",
+          `${counts.new} 筆聯絡表單尚未聯絡` + (ageDays > 3 ? `（最早一筆已等 ${Math.floor(ageDays)} 天）` : ""), "contacts");
+      }
+      if (mailFailed.n) alert("serious", `近 7 天有 ${mailFailed.n} 筆聯絡表單通知信寄送失敗（資料已保存）`, "contacts");
+    } catch (error) {
+      console.error("dashboard contacts failed:", error);
+    }
+  }
+
+  // ---- 頁面內容與 SEO ----
+  if (can("pages")) {
+    try {
+      await ensureVersionTables(env);
+      const content = await loadSiteContent(env);
+      const draft = await loadDraft(env);
+      const holder = await readLock(env);
+      const lastVersion = await env.DB.prepare(
+        "SELECT id, created_at, created_by, source, note FROM site_versions WHERE is_baseline = 0 ORDER BY id DESC LIMIT 1"
+      ).first();
+      const vCount = await env.DB.prepare("SELECT SUM(is_baseline = 0) AS normal, SUM(is_baseline = 1) AS baseline FROM site_versions").first();
+
+      let hidden = 0;
+      let clones = 0;
+      for (const [k, r] of content) {
+        if (r.type === "layout" && k.startsWith("layout.")) {
+          const l = parseJsonValue(r.value) || {};
+          hidden += (l.hidden || []).length;
+          clones += Object.keys(l.clones || {}).length;
+        }
+      }
+
+      out.content = {
+        customized: [...content.values()].filter((r) => r.type === "text" || r.type === "image").length,
+        styled: [...content.values()].filter((r) => r.type === "tstyle" || r.type === "bstyle").length,
+        hidden_boxes: hidden,
+        cloned_boxes: clones,
+        draft_count: draft.length,
+        draft_by: [...new Set(draft.map((d) => d.updated_by).filter(Boolean))],
+        draft_updated: draft.reduce((m, d) => (d.updated_at > m ? d.updated_at : m), ""),
+        editor: holder ? { email: holder.email, name: holder.name, since: holder.acquired_at } : null,
+        last_version: lastVersion || null,
+        versions: vCount.normal || 0,
+        baselines: vCount.baseline || 0
+      };
+
+      out.seo = await seoStatus(env, content);
+
+      if (draft.length) alert("warning", `有 ${draft.length} 處頁面修改存成草稿、尚未發布`, "pages");
+      const seoBad = out.seo.checks.filter((c) => c.level !== "good");
+      if (seoBad.length) alert("warning", "SEO 有 " + seoBad.length + " 項建議調整：" + seoBad.map((c) => c.label).join("、"), "seo");
+    } catch (error) {
+      console.error("dashboard content failed:", error);
+    }
+  }
+
+  // ---- 文件 ----
+  if (can("documents")) {
+    try {
+      const docs = (await env.DB.prepare(
+        "SELECT id, category, title, year, is_public, file_name, file_size, COALESCE(updated_at, published_at) AS t FROM documents ORDER BY t DESC, id DESC"
+      ).all()).results || [];
+      const cats = {};
+      for (const d of docs) cats[d.category] = (cats[d.category] || 0) + 1;
+      out.documents = {
+        total: docs.length,
+        public: docs.filter((d) => d.is_public).length,
+        hidden: docs.filter((d) => !d.is_public).length,
+        size: docs.reduce((s, d) => s + (Number(d.file_size) || 0), 0),
+        categories: Object.entries(cats).map(([label, n]) => ({ label, n })).sort((a, b) => b.n - a.n),
+        latest: docs.slice(0, 5)
+      };
+    } catch (error) {
+      console.error("dashboard documents failed:", error);
+    }
+  }
+
+  // ---- 系統（備份、健康檢查、操作紀錄）----
+  if (can("users")) {
+    try {
+      const obj = env.BACKUPS ? await env.BACKUPS.get("status/last-run.json") : null;
+      const last = obj ? await obj.json() : null;
+      await ensureAuditTable(env);
+      const audit = (await env.DB.prepare("SELECT id, at, email, method, path, status FROM audit_logs ORDER BY id DESC LIMIT 8").all()).results || [];
+      const users = await env.DB.prepare("SELECT COUNT(*) AS n FROM admin_users WHERE is_active = 1").first().catch(() => ({ n: 0 }));
+      out.system = {
+        last_run: last ? {
+          at: last.at, by: last.by, errors: last.errors || [],
+          issues: (last.health && last.health.issues) || [],
+          files: last.files || null, d1: last.d1 || null
+        } : null,
+        audit,
+        active_users: users ? users.n : 0,
+        super_admins: superAdmins(env).length
+      };
+
+      if (!last) {
+        alert("warning", "還沒有備份紀錄，請到「系統備份」按一次「立即備份」", "backups");
+      } else {
+        const hours = (Date.now() - new Date(last.at).getTime()) / 3600000;
+        if (hours > 30) alert("serious", `最近一次備份是 ${Math.floor(hours)} 小時前，每日自動備份可能沒有執行`, "backups");
+        for (const issue of (last.health && last.health.issues) || []) alert("serious", issue, "backups");
+        if ((last.errors || []).length) alert("critical", "備份有錯誤：" + last.errors.join("；"), "backups");
+      }
+    } catch (error) {
+      console.error("dashboard system failed:", error);
+    }
+  }
+
+  const order = { critical: 0, serious: 1, warning: 2, good: 3 };
+  out.alerts.sort((a, b) => order[a.level] - order[b.level]);
+  return json(out);
+}
+
 // 修改紀錄：依批次分組，最近的在前
 async function listContentHistory(url, env) {
   await ensureSiteContentTable(env);
@@ -4084,6 +4340,44 @@ th{
   .lock-bar { margin-top: 10px; padding: 10px 12px; border-radius: 10px; background: #fff3e6; color: #8a3b00; font-weight: 700; }
   .lock-cover { position: absolute; inset: 0; z-index: 5; background: rgba(245,246,251,.55); cursor: not-allowed; display: flex; align-items: flex-start; justify-content: center; }
   .lock-cover-msg { margin-top: 24px; background: #fff; border-radius: 12px; padding: 12px 18px; box-shadow: 0 10px 30px rgba(13,4,95,.18); font-weight: 700; color: #8a3b00; max-width: 80%; }
+  .dash-head { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 14px; gap: 12px; }
+  .dash-head h2 { color: var(--blue); }
+  .dash-alerts h3, .dash-card-head h3 { margin: 0 0 10px; font-size: 17px; color: var(--blue); }
+  .dash-alert { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 10px; margin: 6px 0; cursor: pointer; font-weight: 600; }
+  .dash-alert:hover { filter: brightness(.97); }
+  .dash-alert .lv { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 800; padding: 2px 8px; border-radius: 999px; color: #fff; white-space: nowrap; }
+  .lv-critical { background: #fde8e8; } .lv-critical .lv { background: #b91c1c; }
+  .lv-serious { background: #fff0e6; } .lv-serious .lv { background: #c2410c; }
+  .lv-warning { background: #fff8e1; } .lv-warning .lv { background: #a16207; }
+  .lv-good { background: #eaf6ee; } .lv-good .lv { background: #1f7a3d; }
+  .dash-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 18px; }
+  .dash-tile { background: #fff; border-radius: 16px; padding: 16px 18px; box-shadow: 0 10px 30px rgba(13,4,95,.06); cursor: pointer; border: 1px solid transparent; }
+  .dash-tile:hover { border-color: var(--line); }
+  .dash-tile .t { font-size: 13px; color: var(--muted); }
+  .dash-tile .v { font-size: 30px; font-weight: 800; color: var(--ink, #17172a); margin: 4px 0 2px; line-height: 1.1; }
+  .dash-tile .s { font-size: 12px; color: var(--muted); }
+  .dash-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+  .dash-grid > .panel { margin: 0; }
+  .dash-card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .dash-sub { font-size: 12px; color: var(--muted); margin: 10px 0 6px; font-weight: 700; }
+  .dash-split { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+  .dash-row { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+  .dash-row:last-child { border-bottom: 0; }
+  .dash-row .k { color: var(--muted); }
+  .dash-row .val { font-weight: 700; text-align: right; }
+  .dash-meter { height: 6px; background: #eceef6; border-radius: 3px; margin-top: 3px; overflow: hidden; }
+  .dash-meter i { display: block; height: 100%; background: #3f3fd0; border-radius: 3px; }
+  .dash-chart { position: relative; }
+  .dash-chart svg { display: block; width: 100%; height: 170px; }
+  .dash-tip { position: absolute; pointer-events: none; background: #17172a; color: #fff; font-size: 12px; padding: 5px 8px; border-radius: 6px; white-space: nowrap; transform: translate(-50%, -110%); display: none; }
+  .seo-item { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .seo-item:last-child { border-bottom: 0; }
+  .seo-item .ic { width: 22px; height: 22px; border-radius: 50%; color: #fff; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 800; flex: none; margin-top: 2px; }
+  .seo-item .ic.good { background: #1f7a3d; } .seo-item .ic.warning { background: #a16207; } .seo-item .ic.critical { background: #b91c1c; }
+  .seo-item .lb { font-weight: 700; font-size: 14px; }
+  .seo-item .dt { font-size: 12px; color: var(--muted); }
+  .seo-item .vv { font-size: 12px; color: var(--ink, #17172a); margin-top: 2px; word-break: break-all; }
+  @media (max-width: 1100px) { .dash-grid { grid-template-columns: 1fr; } .dash-split { grid-template-columns: 1fr 1fr; } }
 </style>
 
 </head>
@@ -4222,74 +4516,89 @@ th{
     class="section active"
   >
 
-    <div class="panel">
+    <div class="dash-head">
+      <div>
+        <h2 style="margin:0">儀表板</h2>
+        <div class="muted" id="dashUpdated">讀取中…</div>
+      </div>
+      <button class="btn ghost sm" type="button" id="dashRefresh">重新整理</button>
+    </div>
 
-      <h2>
-        儀表板
-      </h2>
+    <div class="panel dash-alerts" id="dashAlertsPanel">
+      <h3>需要處理</h3>
+      <div id="dashAlerts" class="muted">讀取中…</div>
+    </div>
 
-      <div class="count-grid">
+    <div class="dash-tiles" id="dashTiles"></div>
 
-        <div class="count">
-
-          <span>
-            董事資料
-          </span>
-
-          <strong
-            id="boardCount"
-          >
-            0
-          </strong>
-
+    <div class="dash-grid">
+      <div class="panel" id="dashContactsPanel" style="display:none">
+        <div class="dash-card-head">
+          <h3>聯絡表單：近 30 天</h3>
+          <button class="btn ghost sm" type="button" data-goto="contacts">查看全部 →</button>
         </div>
-
-
-        <div class="count">
-
-          <span>
-            文件數量
-          </span>
-
-          <strong
-            id="docCount"
-          >
-            0
-          </strong>
-
+        <div id="dashChart" class="dash-chart"></div>
+        <div class="dash-split">
+          <div>
+            <div class="dash-sub">處理狀態</div>
+            <div id="dashStatus"></div>
+          </div>
+          <div>
+            <div class="dash-sub">地區（近 90 天）</div>
+            <div id="dashCities"></div>
+          </div>
+          <div>
+            <div class="dash-sub">類型（近 90 天）</div>
+            <div id="dashTypes"></div>
+          </div>
         </div>
-
-
-        <div class="count">
-
-          <span>
-            公開文件
-          </span>
-
-          <strong
-            id="publicDocCount"
-          >
-            0
-          </strong>
-
-        </div>
-
       </div>
 
+      <div class="panel" id="dashSeoPanel" style="display:none">
+        <div class="dash-card-head">
+          <h3>SEO 狀態 <span id="dashSeoScore" class="badge"></span></h3>
+          <button class="btn ghost sm" type="button" data-goto="seo">調整 →</button>
+        </div>
+        <div id="dashSeo"></div>
+      </div>
 
-      <p
-        class="muted"
-        style="
-          margin-top:18px
-        "
-      >
+      <div class="panel" id="dashLatestPanel" style="display:none">
+        <div class="dash-card-head">
+          <h3>最新聯絡表單</h3>
+          <button class="btn ghost sm" type="button" data-goto="contacts">前往 →</button>
+        </div>
+        <div id="dashLatest"></div>
+      </div>
 
-        登入之後會由 Cloudflare Access Email OTP 保護；
-        本後台不保存密碼。
+      <div class="panel" id="dashContentPanel" style="display:none">
+        <div class="dash-card-head">
+          <h3>網站內容</h3>
+          <button class="btn ghost sm" type="button" data-goto="pages">編輯頁面 →</button>
+        </div>
+        <div id="dashContent"></div>
+      </div>
 
-      </p>
+      <div class="panel" id="dashDocsPanel" style="display:none">
+        <div class="dash-card-head">
+          <h3>文件</h3>
+          <button class="btn ghost sm" type="button" data-goto="documents">管理 →</button>
+        </div>
+        <div id="dashDocs"></div>
+      </div>
 
+      <div class="panel" id="dashSystemPanel" style="display:none">
+        <div class="dash-card-head">
+          <h3>系統與最近操作</h3>
+          <button class="btn ghost sm" type="button" data-goto="audit">操作紀錄 →</button>
+        </div>
+        <div id="dashSystem"></div>
+      </div>
     </div>
+
+    <p class="muted" style="margin-top:4px">
+      登入由 Cloudflare Access Email OTP 保護，本後台不保存密碼。儀表板只顯示你有權限的項目。
+    </p>
+    <span id="boardCount" hidden></span><span id="docCount" hidden></span><span id="publicDocCount" hidden></span>
 
   </section>
 
@@ -5750,6 +6059,8 @@ async function load() {
   renderUsers();
 
   renderCounts();
+
+  if (document.getElementById("dashboard").classList.contains("active")) loadDashboard();
 }
 
 
@@ -7896,6 +8207,230 @@ document.querySelector('.nav button[data-target="versions"]').addEventListener("
 document.querySelector('.nav button[data-target="history"]').addEventListener("click", function() { loadHistory(); });
 
 
+// ===== 儀表板 =====
+
+var DASH_LEVEL = {
+  critical: ["✕", "緊急"],
+  serious: ["▲", "重要"],
+  warning: ["!", "提醒"],
+  good: ["✓", "正常"]
+};
+var CONTACT_STATUS_LABEL = { "new": "新進件", "contacted": "已聯絡", "closed": "已結案", "spam": "垃圾訊息" };
+var dashData = null;
+
+function gotoSection(target) {
+  var b = document.querySelector('.nav button[data-target="' + target + '"]');
+  if (b && b.style.display !== "none") b.click();
+}
+
+document.getElementById("dashboard").addEventListener("click", function(e) {
+  var t = e.target.closest("[data-goto]");
+  if (t) gotoSection(t.getAttribute("data-goto"));
+});
+document.getElementById("dashRefresh").addEventListener("click", function() { loadDashboard(); });
+document.querySelector('.nav button[data-target="dashboard"]').addEventListener("click", function() { loadDashboard(); });
+
+async function loadDashboard() {
+  try {
+    dashData = await api("/api/admin/dashboard");
+    renderDashboard();
+  } catch (err) {
+    document.getElementById("dashAlerts").textContent = "儀表板讀取失敗：" + err.message;
+  }
+}
+
+function dashTile(title, value, sub, target) {
+  return '<div class="dash-tile"' + (target ? ' data-goto="' + target + '"' : "") + '>' +
+    '<div class="t">' + esc(title) + '</div><div class="v">' + esc(String(value)) + '</div><div class="s">' + (sub || "") + "</div></div>";
+}
+
+function dashRows(rows) {
+  return rows.map(function(r) {
+    return '<div class="dash-row"><span class="k">' + esc(r[0]) + '</span><span class="val">' + r[1] + "</span></div>";
+  }).join("");
+}
+
+function dashBars(items, total) {
+  if (!items.length) return '<div class="muted" style="font-size:13px">尚無資料</div>';
+  var max = Math.max.apply(null, items.map(function(x) { return x.n; })) || 1;
+  return items.map(function(x) {
+    return '<div style="margin:6px 0"><div class="dash-row" style="border:0;padding:0"><span class="k">' + esc(x.label) +
+      '</span><span class="val">' + x.n + (total ? '<span class="muted" style="font-weight:400"> ・' + Math.round(x.n * 100 / total) + "%</span>" : "") +
+      '</span></div><div class="dash-meter"><i style="width:' + Math.round(x.n * 100 / max) + '%"></i></div></div>';
+  }).join("");
+}
+
+function relDays(t) {
+  if (!t) return "";
+  var d = (Date.now() - new Date(String(t).replace(" ", "T") + (String(t).indexOf("Z") >= 0 ? "" : "Z")).getTime()) / 86400000;
+  if (d < 1 / 24) return "剛剛";
+  if (d < 1) return Math.floor(d * 24) + " 小時前";
+  return Math.floor(d) + " 天前";
+}
+
+// 近 30 天每日件數：單一數列的直條圖（4px 圓角頂端、2px 間隔、滑鼠移上顯示數字）
+function renderContactChart(days) {
+  var box = document.getElementById("dashChart");
+  var W = 600, H = 170, padL = 26, padB = 22, padT = 10;
+  var max = Math.max(1, Math.max.apply(null, days.map(function(d) { return d.count; })));
+  var step = max <= 4 ? 1 : Math.ceil(max / 4);
+  var top = Math.ceil(max / step) * step;
+  var slot = (W - padL) / days.length;
+  var bw = Math.min(14, slot - 2);
+  var y = function(v) { return padT + (H - padT - padB) * (1 - v / top); };
+  var svg = '<svg viewBox="0 0 ' + W + " " + H + '" preserveAspectRatio="none" role="img" aria-label="近 30 天聯絡表單每日件數，共 ' +
+    days.reduce(function(a, d) { return a + d.count; }, 0) + ' 件">';
+  for (var g = 0; g <= top; g += step) {
+    svg += '<line x1="' + padL + '" x2="' + W + '" y1="' + y(g) + '" y2="' + y(g) + '" stroke="#e6e8f0" stroke-width="1" vector-effect="non-scaling-stroke"/>' +
+      '<text x="' + (padL - 6) + '" y="' + (y(g) + 4) + '" font-size="11" fill="#68687a" text-anchor="end">' + g + "</text>";
+  }
+  days.forEach(function(d, i) {
+    var x = padL + i * slot + (slot - bw) / 2;
+    if (d.count) {
+      var yy = y(d.count), h = H - padB - yy, r = Math.min(4, h, bw / 2);
+      svg += '<path d="M' + x + " " + (H - padB) + " V" + (yy + r) + " Q" + x + " " + yy + " " + (x + r) + " " + yy +
+        " H" + (x + bw - r) + " Q" + (x + bw) + " " + yy + " " + (x + bw) + " " + (yy + r) + " V" + (H - padB) + ' Z" fill="#3f3fd0"/>';
+    }
+    svg += '<rect class="hit" data-i="' + i + '" x="' + (padL + i * slot) + '" y="' + padT + '" width="' + slot + '" height="' + (H - padT - padB) + '" fill="transparent"/>';
+    if ((days.length - 1 - i) % 7 === 0) {
+      var last = i === days.length - 1;
+      svg += '<text x="' + (last ? x + bw : x + bw / 2) + '" y="' + (H - 6) + '" font-size="11" fill="#68687a" text-anchor="' + (last ? "end" : "middle") + '">' + d.date.slice(5).replace("-", "/") + "</text>";
+    }
+  });
+  svg += "</svg>";
+  box.innerHTML = svg + '<div class="dash-tip" id="dashTip"></div>';
+
+  var tip = document.getElementById("dashTip");
+  box.querySelectorAll(".hit").forEach(function(rect) {
+    rect.addEventListener("mouseenter", function() {
+      var d = days[Number(rect.getAttribute("data-i"))];
+      var br = box.getBoundingClientRect(), rr = rect.getBoundingClientRect();
+      tip.textContent = d.date.replace(/-/g, "/") + "：" + d.count + " 件";
+      tip.style.left = (rr.left - br.left + rr.width / 2) + "px";
+      tip.style.top = (box.querySelector("svg").getBoundingClientRect().height * (y(d.count) / H)) + "px";
+      tip.style.display = "block";
+    });
+    rect.addEventListener("mouseleave", function() { tip.style.display = "none"; });
+  });
+}
+
+function renderDashboard() {
+  var d = dashData;
+  document.getElementById("dashUpdated").textContent = "更新時間：" + twTime(d.generated_at);
+
+  // 需要處理
+  var alerts = d.alerts || [];
+  document.getElementById("dashAlerts").innerHTML = alerts.length
+    ? alerts.map(function(a) {
+        var lv = DASH_LEVEL[a.level] || DASH_LEVEL.warning;
+        return '<div class="dash-alert lv-' + a.level + '" data-goto="' + escAttr(a.target || "dashboard") + '"><span class="lv">' + lv[0] + " " + lv[1] + "</span>" + esc(a.text) + "</div>";
+      }).join("")
+    : '<div class="dash-alert lv-good"><span class="lv">✓ 正常</span>目前沒有需要處理的事項</div>';
+
+  // 數字卡
+  var tiles = [];
+  if (d.contacts) {
+    var c = d.contacts;
+    var diff = c.this_month - c.last_month;
+    tiles.push(dashTile("待聯絡（新進件）", c.counts["new"] || 0, c.oldest_new ? "最早一筆 " + relDays(c.oldest_new) : "全部都處理了", "contacts"));
+    tiles.push(dashTile("本月聯絡表單", c.this_month, "上月 " + c.last_month + " 件" + (diff ? "（" + (diff > 0 ? "+" : "") + diff + "）" : ""), "contacts"));
+  }
+  if (d.seo) tiles.push(dashTile("SEO 檢查", d.seo.passed + " / " + d.seo.total, d.seo.passed === d.seo.total ? "全部通過" : "有 " + (d.seo.total - d.seo.passed) + " 項建議調整", "seo"));
+  if (d.content) tiles.push(dashTile("待發布草稿", d.content.draft_count, d.content.draft_count ? "由 " + d.content.draft_by.join("、") : "沒有未發布的修改", "pages"));
+  if (d.documents) tiles.push(dashTile("公開文件", d.documents.public, "共 " + d.documents.total + " 份，隱藏 " + d.documents.hidden + " 份", "documents"));
+  if (d.system) {
+    var lr = d.system.last_run;
+    tiles.push(dashTile("上次備份", lr ? relDays(lr.at) : "尚無", lr ? twTime(lr.at) + (lr.errors.length ? "（有錯誤）" : "（成功）") : "請先執行一次備份", "backups"));
+  }
+  tiles.push(dashTile("董事 / 常見問題", (state.board || []).length + " / " + (state.faqs || []).length, "官網顯示中的資料筆數", null));
+  document.getElementById("dashTiles").innerHTML = tiles.join("");
+
+  // 聯絡表單
+  document.getElementById("dashContactsPanel").style.display = d.contacts ? "" : "none";
+  document.getElementById("dashLatestPanel").style.display = d.contacts ? "" : "none";
+  if (d.contacts) {
+    var c2 = d.contacts;
+    renderContactChart(c2.days);
+    var totalStatus = c2.counts["new"] + c2.counts.contacted + c2.counts.closed;
+    document.getElementById("dashStatus").innerHTML = dashBars(["new", "contacted", "closed"].map(function(k) {
+      return { label: CONTACT_STATUS_LABEL[k], n: c2.counts[k] || 0 };
+    }), totalStatus);
+    var cityTotal = c2.cities.reduce(function(a, x) { return a + x.n; }, 0);
+    document.getElementById("dashCities").innerHTML = dashBars(c2.cities, cityTotal);
+    document.getElementById("dashTypes").innerHTML = dashBars(c2.types, c2.types.reduce(function(a, x) { return a + x.n; }, 0));
+    document.getElementById("dashLatest").innerHTML = c2.latest.length
+      ? dashRows(c2.latest.map(function(x) {
+          return [twTime(x.created_at).slice(5, 16) + "　" + (x.name || "") + "（" + (x.city || "-") + "）",
+            esc(x.type || "") + ' <span class="badge"' + (x.status === "new" ? ' style="background:#fff0e6;color:#c2410c"' : "") + ">" + (CONTACT_STATUS_LABEL[x.status] || x.status) + "</span>"];
+        }))
+      : '<div class="muted">尚無聯絡表單。</div>';
+  }
+
+  // SEO
+  document.getElementById("dashSeoPanel").style.display = d.seo ? "" : "none";
+  if (d.seo) {
+    var sc = document.getElementById("dashSeoScore");
+    sc.textContent = d.seo.passed + " / " + d.seo.total + " 通過";
+    sc.style.cssText = d.seo.passed === d.seo.total ? "background:#eaf6ee;color:#1f7a3d" : "background:#fff8e1;color:#a16207";
+    document.getElementById("dashSeo").innerHTML = d.seo.checks.map(function(ck) {
+      var icon = ck.level === "good" ? "✓" : ck.level === "critical" ? "✕" : "!";
+      var lvText = ck.level === "good" ? "正常" : ck.level === "critical" ? "缺少" : "建議調整";
+      return '<div class="seo-item"><span class="ic ' + ck.level + '" title="' + lvText + '">' + icon + "</span><div>" +
+        '<div class="lb">' + esc(ck.label) + ' <span class="muted" style="font-weight:400;font-size:12px">' + lvText + "</span></div>" +
+        '<div class="dt">' + esc(ck.detail) + (ck.hint ? "：" + esc(ck.hint) : "") + "</div>" +
+        (ck.value && ck.label.indexOf("圖片") < 0 ? '<div class="vv">' + esc(ck.value) + "</div>" : "") +
+        "</div></div>";
+    }).join("") +
+    '<div class="muted" style="font-size:12px;margin-top:8px">排名與點擊數要到 Google Search Console 查看（需先驗證網域）。</div>';
+  }
+
+  // 網站內容
+  document.getElementById("dashContentPanel").style.display = d.content ? "" : "none";
+  if (d.content) {
+    var ct = d.content, lv2 = ct.last_version;
+    document.getElementById("dashContent").innerHTML = dashRows([
+      ["最後發布", lv2 ? esc(twTime(lv2.created_at)) + '<br><span class="muted" style="font-weight:400">' + esc(lv2.created_by) + (lv2.note ? "｜" + esc(lv2.note) : "") + "</span>" : "尚未發布過"],
+      ["目前編輯中", ct.editor ? esc(ct.editor.name || ct.editor.email) + "（" + esc(ct.editor.email) + "）" : "沒有人"],
+      ["待發布草稿", ct.draft_count ? ct.draft_count + " 處" : "無"],
+      ["已修改的文字 / 圖片", ct.customized + " 處"],
+      ["自訂樣式", ct.styled + " 處"],
+      ["隱藏 / 複製的框框", ct.hidden_boxes + " / " + ct.cloned_boxes],
+      ["版本 / 還原點", ct.versions + " / " + ct.baselines]
+    ]);
+  }
+
+  // 文件
+  document.getElementById("dashDocsPanel").style.display = d.documents ? "" : "none";
+  if (d.documents) {
+    var dc = d.documents;
+    document.getElementById("dashDocs").innerHTML =
+      dashRows([["文件總數", dc.total + " 份"], ["公開 / 隱藏", dc.public + " / " + dc.hidden], ["檔案總大小", fmtSize(dc.size)]]) +
+      '<div class="dash-sub">依分類</div>' + dashBars(dc.categories, dc.total) +
+      '<div class="dash-sub">最近更新</div>' +
+      (dc.latest.length ? dashRows(dc.latest.map(function(x) {
+        return [x.title, esc(x.category) + (x.is_public ? "" : ' <span class="badge">隱藏</span>')];
+      })) : '<div class="muted">尚無文件。</div>');
+  }
+
+  // 系統
+  document.getElementById("dashSystemPanel").style.display = d.system ? "" : "none";
+  if (d.system) {
+    var sy = d.system, lr2 = sy.last_run;
+    document.getElementById("dashSystem").innerHTML =
+      dashRows([
+        ["上次備份 / 健康檢查", lr2 ? esc(twTime(lr2.at)) + "（" + (lr2.by === "cron" ? "自動" : esc(lr2.by)) + "）" : "尚無紀錄"],
+        ["健康檢查", lr2 ? (lr2.issues.length ? '<span style="color:#c2410c">▲ ' + lr2.issues.length + " 項異常</span>" : '<span style="color:#1f7a3d">✓ 正常</span>') : "-"],
+        ["檔案備份", lr2 && lr2.files ? lr2.files.total + " 個檔案" : "-"],
+        ["後台帳號", sy.active_users + " 個啟用＋" + sy.super_admins + " 位系統管理員"]
+      ]) +
+      '<div class="dash-sub">最近操作</div>' +
+      (sy.audit.length ? dashRows(sy.audit.map(function(r) {
+        return [twTime(r.at).slice(5, 16) + "　" + r.email.split("@")[0], esc(auditAction(r)) + (r.status >= 400 ? ' <span style="color:#b91c1c">失敗</span>' : "")];
+      })) : '<div class="muted">尚無紀錄。</div>');
+  }
+}
+
+
 // ===== 聯絡表單 =====
 
 var contactState = { items: [], loadedOnce: false };
@@ -7905,7 +8440,9 @@ var MAIL_LABEL = { "sent": "已寄出", "failed": "寄送失敗", "pending": "�
 
 function twTime(v) {
   if (!v) return "";
-  var d = new Date(String(v).replace(" ", "T") + "Z");
+  var str = String(v);
+  // D1 的時間是 UTC「YYYY-MM-DD HH:MM:SS」；已帶時區（ISO 的 Z）就不要再補
+  var d = new Date(str.indexOf("Z") >= 0 || str.indexOf("+") > 10 ? str : str.replace(" ", "T") + "Z");
   if (isNaN(d.getTime())) return v;
   return d.toLocaleString("zh-TW", { timeZone: "Asia/Taipei", hour12: false });
 }
