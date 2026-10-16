@@ -98,9 +98,25 @@ export default {
       // 首頁：把後台編輯過的文字/圖片套進 HTML（HTMLRewriter，搜尋引擎也看得到）
       if (path === "/" && request.method === "GET") {
         ctx?.passThroughOnException?.();
-        // 編輯器模式（?cms-edit=1）且已通過 Access 登入：隱藏的框框也輸出（標記 data-cms-hidden），並附上目前樣式
-        const editMode = url.searchParams.has("cms-edit") && (await verifyAccess(request, env)).ok;
-        return renderHomepage(request, env, editMode);
+        // 後台專用的檢視模式（必須已通過 Access 登入且有「頁面內容」權限）：
+        //   ?cms-edit=1     編輯器：正式內容 + 草稿，隱藏的框框也輸出（標記 data-cms-hidden）並附上目前樣式
+        //   ?cms-preview=1  預覽草稿：正式內容 + 草稿，看起來和上線後一樣
+        //   ?cms-version=ID 預覽某個歷史版本
+        const wants = ["cms-edit", "cms-preview", "cms-version"].some((k) => url.searchParams.has(k));
+        let viewer = null;
+        if (wants) {
+          const acc = await verifyAccess(request, env);
+          if (acc.ok) {
+            const u = await loadAdminUser(env, acc.email).catch(() => null);
+            if (u && u.permissions.includes("pages")) viewer = u;
+          }
+        }
+        return renderHomepage(request, env, {
+          edit: !!viewer && url.searchParams.has("cms-edit"),
+          draft: !!viewer && (url.searchParams.has("cms-edit") || url.searchParams.has("cms-preview")),
+          version: viewer && url.searchParams.has("cms-version") ? Number(url.searchParams.get("cms-version")) || 0 : 0,
+          banner: viewer ? (url.searchParams.has("cms-preview") ? "草稿預覽（尚未上線）" : url.searchParams.has("cms-version") ? "歷史版本預覽 #" + url.searchParams.get("cms-version") : "") : ""
+        });
       }
 
       // 搜尋引擎：sitemap 依後台資料的最後更新時間產生；Worker 失敗時由 Pages 的靜態檔接手
@@ -241,6 +257,34 @@ export default {
       // ===== 頁面內容 =====
       if (path === "/api/admin/content" && request.method === "PUT") {
         return saveSiteContent(request, env, me);
+      }
+
+      if (path === "/api/admin/content/draft" && request.method === "GET") {
+        return getDraft(env);
+      }
+
+      if (path === "/api/admin/content/draft" && request.method === "PUT") {
+        return saveDraft(request, env, me);
+      }
+
+      if (path === "/api/admin/content/draft" && request.method === "DELETE") {
+        return discardDraft(env);
+      }
+
+      if (path === "/api/admin/content/publish" && request.method === "POST") {
+        return publishDraft(request, env, me);
+      }
+
+      if (path === "/api/admin/content/versions" && request.method === "GET") {
+        return listVersions(env);
+      }
+
+      const versionMatch = path.match(/^\/api\/admin\/content\/versions\/(\d+)\/(restore|baseline)$/);
+
+      if (versionMatch && request.method === "POST") {
+        return versionMatch[2] === "restore"
+          ? restoreVersion(env, me, Number(versionMatch[1]))
+          : setBaseline(request, env, me, Number(versionMatch[1]));
       }
 
       if (path === "/api/admin/content/history" && request.method === "GET") {
@@ -2158,8 +2202,54 @@ async function saveSiteContent(request, env, me) {
 }
 
 // 套用頁面內容修改，並把「修改前 / 修改後」記錄到 site_content_history（同一批次一個 batch_id）
-async function applyContentChanges(env, me, changes, source) {
-  await ensureSiteContentTable(env);
+// 檢查並整理一項內容修改；回傳 { error } 或 { value: null | { type, value } }
+function resolveContentChange(key, c) {
+    if (!CONTENT_KEY_RE.test(key) || key.length > 80) {
+      return { error: `欄位代碼不正確：${key}` };
+    }
+
+    
+    if (c === null) {
+      return { value: null };
+    }
+    if (!c || typeof c !== "object") return { error: "內容類型不正確。" };
+
+    if (c.type === "text") {
+      const value = sanitizeInlineHtml(c.value);
+      if (!value) return { error: `「${key}」不可空白；要恢復原文請用「還原預設」。` };
+      return { value: { type: "text", value } };
+    } else if (c.type === "plain") {
+      // SEO 標題/描述：純文字，不允許任何 HTML
+      const value = String(c.value ?? "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim().slice(0, SEO_MAX[key] || 300);
+      if (!value) return { error: `「${key}」不可空白；要恢復預設請用「還原預設」。` };
+      return { value: { type: "plain", value } };
+    } else if (c.type === "image") {
+      const value = String(c.value || "");
+      if (!MEDIA_URL_RE.test(value)) return { error: "圖片網址不正確。" };
+      return { value: { type: "image", value } };
+    } else if (c.type === "layout") {
+      if (!key.startsWith("layout.")) return { error: `欄位代碼不正確：${key}` };
+      const norm = normalizeLayout(parseJsonValue(c.value), key.slice(7));
+      if (!norm) return { error: "區塊排列資料不正確。" };
+      return { value: { type: "layout", value: JSON.stringify(norm) } };
+    } else if (c.type === "tstyle") {
+      if (!key.startsWith("style.")) return { error: `欄位代碼不正確：${key}` };
+      const norm = normalizeTextStyle(parseJsonValue(c.value));
+      return { value: norm ? { type: "tstyle", value: JSON.stringify(norm) } : null };
+    } else if (c.type === "bstyle") {
+      if (!key.startsWith("bstyle.")) return { error: `欄位代碼不正確：${key}` };
+      const norm = normalizeBoxStyle(parseJsonValue(c.value));
+      return { value: norm ? { type: "bstyle", value: JSON.stringify(norm) } : null };
+    } else {
+      return { error: "內容類型不正確。" };
+    }
+  
+  return { error: "內容類型不正確。" };
+}
+
+async function applyContentChanges(env, me, changes, source, note) {
+  // 先確保版本表存在：第一次使用時的「啟用版本控制時的正式內容」還原點要在修改「之前」建立
+  await ensureVersionTables(env);
   const keys = Object.keys(changes);
 
   if (!keys.length) return json({ ok: false, message: "沒有需要儲存的修改。" }, 400);
@@ -2167,48 +2257,10 @@ async function applyContentChanges(env, me, changes, source) {
 
   // 先把每一項整理成要寫入的值（null = 刪除，恢復網站原始內容 / 樣式）
   const resolved = new Map();
-
   for (const key of keys) {
-    if (!CONTENT_KEY_RE.test(key) || key.length > 80) {
-      return json({ ok: false, message: `欄位代碼不正確：${key}` }, 400);
-    }
-
-    const c = changes[key];
-
-    if (c === null) {
-      resolved.set(key, null);
-      continue;
-    }
-
-    if (c.type === "text") {
-      const value = sanitizeInlineHtml(c.value);
-      if (!value) return json({ ok: false, message: `「${key}」不可空白；要恢復原文請用「還原預設」。` }, 400);
-      resolved.set(key, { type: "text", value });
-    } else if (c.type === "plain") {
-      // SEO 標題/描述：純文字，不允許任何 HTML
-      const value = String(c.value ?? "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim().slice(0, SEO_MAX[key] || 300);
-      if (!value) return json({ ok: false, message: `「${key}」不可空白；要恢復預設請用「還原預設」。` }, 400);
-      resolved.set(key, { type: "plain", value });
-    } else if (c.type === "image") {
-      const value = String(c.value || "");
-      if (!MEDIA_URL_RE.test(value)) return json({ ok: false, message: "圖片網址不正確。" }, 400);
-      resolved.set(key, { type: "image", value });
-    } else if (c.type === "layout") {
-      if (!key.startsWith("layout.")) return json({ ok: false, message: `欄位代碼不正確：${key}` }, 400);
-      const norm = normalizeLayout(parseJsonValue(c.value), key.slice(7));
-      if (!norm) return json({ ok: false, message: "區塊排列資料不正確。" }, 400);
-      resolved.set(key, { type: "layout", value: JSON.stringify(norm) });
-    } else if (c.type === "tstyle") {
-      if (!key.startsWith("style.")) return json({ ok: false, message: `欄位代碼不正確：${key}` }, 400);
-      const norm = normalizeTextStyle(parseJsonValue(c.value));
-      resolved.set(key, norm ? { type: "tstyle", value: JSON.stringify(norm) } : null);
-    } else if (c.type === "bstyle") {
-      if (!key.startsWith("bstyle.")) return json({ ok: false, message: `欄位代碼不正確：${key}` }, 400);
-      const norm = normalizeBoxStyle(parseJsonValue(c.value));
-      resolved.set(key, norm ? { type: "bstyle", value: JSON.stringify(norm) } : null);
-    } else {
-      return json({ ok: false, message: "內容類型不正確。" }, 400);
-    }
+    const r = resolveContentChange(key, changes[key]);
+    if (r.error) return json({ ok: false, message: r.error }, 400);
+    resolved.set(key, r.value);
   }
 
   // 修改前的值
@@ -2251,8 +2303,252 @@ async function applyContentChanges(env, me, changes, source) {
 
   if (stmts.length) await env.DB.batch(stmts);
   console.log("site content saved", me.email, source, keys.length, "changed", changed);
+
+  // 正式內容有變動就存一個完整版本，之後可以預覽或還原
+  if (changed) {
+    try {
+      await createVersion(env, me, source, note || VERSION_SOURCE_NOTE[source] || "");
+    } catch (error) {
+      console.error("create version failed:", error);
+    }
+  }
   return json({ ok: true, batch_id: batchId, message: changed ? `已儲存 ${changed} 處修改。` : "內容與目前相同，沒有變更。" });
 }
+
+// ===== 草稿、預覽、版本、還原點 =====
+// 編輯器存的是「草稿」（site_content_draft），只有後台看得到；按「發布上線」才寫進正式內容。
+// 每次正式內容有變動（發布、還原、修改紀錄還原）都會存一個完整版本（site_versions），可以預覽、還原。
+// 還原點（is_baseline=1）不會被自動清除，只有系統管理員（SUPER_ADMINS）可以還原。
+
+const VERSION_KEEP = 50;
+
+let versionTablesReady = false;
+
+async function ensureVersionTables(env) {
+  if (versionTablesReady) return;
+  await ensureSiteContentTable(env);
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS site_content_draft (
+      key TEXT PRIMARY KEY,
+      type TEXT,
+      value TEXT,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_by TEXT
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS site_versions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      created_by TEXT,
+      source TEXT,
+      note TEXT,
+      item_count INTEGER,
+      data TEXT NOT NULL,
+      is_baseline INTEGER DEFAULT 0
+    )
+  `).run();
+  versionTablesReady = true;
+
+  // 第一次啟用：建立兩個還原點——網站原始設計（沒有任何後台修改），以及啟用當下的正式內容
+  const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM site_versions").first();
+  if (!n.n) {
+    const live = await liveRows(env);
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO site_versions (created_by, source, note, item_count, data, is_baseline) VALUES (?, 'baseline', ?, 0, '[]', 1)"
+      ).bind("system", "網站原始設計（沒有任何後台修改）"),
+      env.DB.prepare(
+        "INSERT INTO site_versions (created_by, source, note, item_count, data, is_baseline) VALUES (?, 'baseline', ?, ?, ?, 1)"
+      ).bind("system", "啟用版本控制時的正式內容", live.length, JSON.stringify(live))
+    ]);
+  }
+}
+
+async function liveRows(env) {
+  return (await env.DB.prepare("SELECT key, type, value FROM site_content ORDER BY key").all()).results || [];
+}
+
+async function loadDraft(env) {
+  await ensureVersionTables(env);
+  const rows = (await env.DB.prepare("SELECT key, type, value, updated_at, updated_by FROM site_content_draft ORDER BY key").all()).results || [];
+  return rows;
+}
+
+// 正式內容 + 草稿（草稿 type 為 NULL 代表發布時要刪除，恢復網站原始內容）
+function mergeDraft(live, draftRows) {
+  const merged = new Map(live);
+  for (const d of draftRows) {
+    if (d.type === null) merged.delete(d.key);
+    else merged.set(d.key, { key: d.key, type: d.type, value: d.value });
+  }
+  return merged;
+}
+
+async function createVersion(env, me, source, note) {
+  await ensureVersionTables(env);
+  const live = await liveRows(env);
+  await env.DB.prepare(
+    "INSERT INTO site_versions (created_by, source, note, item_count, data) VALUES (?, ?, ?, ?, ?)"
+  ).bind(me.email, source, note || "", live.length, JSON.stringify(live)).run();
+
+  // 只保留最近 VERSION_KEEP 個一般版本；還原點不刪
+  await env.DB.prepare(`
+    DELETE FROM site_versions
+    WHERE is_baseline = 0 AND id NOT IN (
+      SELECT id FROM site_versions WHERE is_baseline = 0 ORDER BY id DESC LIMIT ?
+    )
+  `).bind(VERSION_KEEP).run();
+}
+
+async function getDraft(env) {
+  const rows = await loadDraft(env);
+  return json({ ok: true, items: rows, count: rows.length });
+}
+
+async function saveDraft(request, env, me) {
+  await ensureVersionTables(env);
+  const body = await request.json();
+  const changes = body && typeof body.changes === "object" ? body.changes : {};
+  const keys = Object.keys(changes);
+  if (!keys.length) return json({ ok: false, message: "沒有需要儲存的修改。" }, 400);
+  if (keys.length > 400) return json({ ok: false, message: "一次修改太多項目。" }, 400);
+
+  const resolved = new Map();
+  for (const key of keys) {
+    const r = resolveContentChange(key, changes[key]);
+    if (r.error) return json({ ok: false, message: r.error }, 400);
+    resolved.set(key, r.value);
+  }
+
+  const placeholders = keys.map(() => "?").join(",");
+  const live = new Map(
+    ((await env.DB.prepare(`SELECT key, type, value FROM site_content WHERE key IN (${placeholders})`)
+      .bind(...keys).all()).results || []).map((r) => [r.key, r])
+  );
+
+  const stmts = [];
+  for (const key of keys) {
+    const next = resolved.get(key);
+    const cur = live.get(key);
+    // 和正式內容一樣 → 草稿不需要這一項
+    if ((cur ? cur.value : null) === (next ? next.value : null)) {
+      stmts.push(env.DB.prepare("DELETE FROM site_content_draft WHERE key = ?").bind(key));
+      continue;
+    }
+    stmts.push(env.DB.prepare(`
+      INSERT INTO site_content_draft (key, type, value, updated_at, updated_by)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        type = excluded.type, value = excluded.value,
+        updated_at = CURRENT_TIMESTAMP, updated_by = excluded.updated_by
+    `).bind(key, next ? next.type : null, next ? next.value : null, me.email));
+  }
+  await env.DB.batch(stmts);
+
+  const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM site_content_draft").first();
+  return json({ ok: true, count: n.n, message: `草稿已儲存（目前共 ${n.n} 處尚未發布）。` });
+}
+
+async function discardDraft(env) {
+  await ensureVersionTables(env);
+  await env.DB.prepare("DELETE FROM site_content_draft").run();
+  return json({ ok: true, message: "草稿已捨棄。" });
+}
+
+async function publishDraft(request, env, me) {
+  await ensureVersionTables(env);
+  const body = await request.json().catch(() => ({}));
+  const note = String(body.note || "").replace(/\s+/g, " ").trim().slice(0, 200);
+  const rows = await loadDraft(env);
+  if (!rows.length) return json({ ok: false, message: "目前沒有草稿可以發布。" }, 400);
+
+  const changes = {};
+  for (const r of rows) changes[r.key] = r.type === null ? null : { type: r.type, value: r.value };
+
+  const res = await applyContentChanges(env, me, changes, "publish", note || "發布草稿");
+  if (res.status !== 200) return res;
+
+  // 只清掉剛發布的那些草稿（發布期間別人又存的新草稿保留）
+  const stmts = rows.map((r) =>
+    env.DB.prepare("DELETE FROM site_content_draft WHERE key = ? AND updated_at = ?").bind(r.key, r.updated_at)
+  );
+  await env.DB.batch(stmts);
+
+  return json({ ok: true, message: `已發布上線（${rows.length} 處）。` });
+}
+
+async function listVersions(env) {
+  await ensureVersionTables(env);
+  const rows = (await env.DB.prepare(`
+    SELECT id, created_at, created_by, source, note, item_count, is_baseline
+    FROM site_versions ORDER BY is_baseline DESC, id DESC LIMIT 120
+  `).all()).results || [];
+  const current = (await env.DB.prepare("SELECT id FROM site_versions WHERE is_baseline = 0 ORDER BY id DESC LIMIT 1").first());
+  return json({ ok: true, items: rows, current_id: current ? current.id : null });
+}
+
+async function restoreVersion(env, me, id) {
+  await ensureVersionTables(env);
+  const v = await env.DB.prepare("SELECT * FROM site_versions WHERE id = ?").bind(id).first();
+  if (!v) return json({ ok: false, message: "找不到這個版本。" }, 404);
+  if (v.is_baseline && !me.is_super) {
+    return json({ ok: false, message: "還原點只有系統管理員可以還原。" }, 403);
+  }
+
+  let snapshot;
+  try {
+    snapshot = JSON.parse(v.data);
+  } catch {
+    return json({ ok: false, message: "版本資料損壞，無法還原。" }, 500);
+  }
+
+  const target = new Map(snapshot.map((r) => [r.key, r]));
+  const live = await liveRows(env);
+  const changes = {};
+  for (const r of live) if (!target.has(r.key)) changes[r.key] = null;
+  for (const r of snapshot) {
+    const cur = live.find((x) => x.key === r.key);
+    if (!cur || cur.value !== r.value || cur.type !== r.type) changes[r.key] = { type: r.type, value: r.value };
+  }
+
+  if (!Object.keys(changes).length) return json({ ok: true, message: "目前的正式內容已經和這個版本相同。" });
+
+  const label = v.is_baseline ? "還原點" : "版本";
+  const res = await applyContentChanges(env, me, changes, "restore", `還原到${label} #${v.id}${v.note ? "（" + v.note + "）" : ""}`, true);
+  if (res.status !== 200) return res;
+  return json({ ok: true, message: `已還原到${label} #${v.id} 並上線。` });
+}
+
+async function setBaseline(request, env, me, id) {
+  if (!me.is_super) return json({ ok: false, message: "只有系統管理員可以設定還原點。" }, 403);
+  await ensureVersionTables(env);
+  const body = await request.json().catch(() => ({}));
+  const on = body.on !== false;
+  const v = await env.DB.prepare("SELECT id, source FROM site_versions WHERE id = ?").bind(id).first();
+  if (!v) return json({ ok: false, message: "找不到這個版本。" }, 404);
+  if (!on && v.source === "baseline") return json({ ok: false, message: "系統建立的還原點不能取消。" }, 400);
+  const note = body.note !== undefined ? String(body.note).trim().slice(0, 200) : null;
+  if (note !== null) {
+    await env.DB.prepare("UPDATE site_versions SET is_baseline = ?, note = ? WHERE id = ?").bind(on ? 1 : 0, note, id).run();
+  } else {
+    await env.DB.prepare("UPDATE site_versions SET is_baseline = ? WHERE id = ?").bind(on ? 1 : 0, id).run();
+  }
+  return json({ ok: true, message: on ? "已設為還原點。" : "已取消還原點。" });
+}
+
+async function versionContent(env, id) {
+  await ensureVersionTables(env);
+  const v = await env.DB.prepare("SELECT data FROM site_versions WHERE id = ?").bind(id).first();
+  if (!v) return null;
+  try {
+    return new Map(JSON.parse(v.data).map((r) => [r.key, r]));
+  } catch {
+    return null;
+  }
+}
+
+const VERSION_SOURCE_NOTE = { edit: "直接儲存", publish: "發布草稿", revert: "從修改紀錄還原", restore: "還原版本" };
 
 // 修改紀錄：依批次分組，最近的在前
 async function listContentHistory(url, env) {
@@ -2658,7 +2954,9 @@ function mergeStyleAttr(el, css) {
   el.setAttribute("style", (cur ? cur.replace(/;?$/, ";") : "") + css);
 }
 
-async function renderHomepage(request, env, editMode) {
+async function renderHomepage(request, env, mode) {
+  mode = mode || {};
+  const editMode = !!mode.edit;
   // 不帶快取條件去拿原始 HTML，避免 304 讓瀏覽器沿用舊內容
   const headers = new Headers(request.headers);
   headers.delete("If-None-Match");
@@ -2670,7 +2968,13 @@ async function renderHomepage(request, env, editMode) {
 
   let content;
   try {
-    content = await loadSiteContent(env);
+    if (mode.version) {
+      content = await versionContent(env, mode.version);
+      if (!content) return new Response("找不到這個版本", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    } else {
+      content = await loadSiteContent(env);
+      if (mode.draft) content = mergeDraft(content, await loadDraft(env));
+    }
   } catch (error) {
     console.error("load site content failed:", error);
     return origin;
@@ -2762,13 +3066,22 @@ async function renderHomepage(request, env, editMode) {
         if (v !== null) el.setAttribute("content", v);
       }
     })
+    .on("body", {
+      element(el) {
+        // 預覽模式在畫面上方加一條提示，避免誤以為已經上線
+        if (mode.banner) {
+          el.prepend('<div style="position:fixed;left:0;right:0;bottom:0;z-index:2147483647;background:#FF7000;color:#fff;text-align:center;font:700 14px/1.2 system-ui,sans-serif;padding:10px">' +
+            escHtml(mode.banner) + "｜此畫面只有後台人員看得到</div>", { html: true });
+        }
+      }
+    })
     .transform(source);
 
   const out = new Response(rewritten.body, rewritten);
   out.headers.delete("ETag");
   out.headers.delete("Last-Modified");
   out.headers.delete("Content-Length");
-  out.headers.set("Cache-Control", editMode ? "private, no-store" : "no-cache");
+  out.headers.set("Cache-Control", mode.edit || mode.draft || mode.version ? "private, no-store" : "no-cache");
   return out;
 }
 
@@ -4704,12 +5017,19 @@ th{
     <div class="panel" id="pageToolbarPanel" style="padding:16px 20px">
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
         <strong style="color:var(--blue)">首頁內容編輯</strong>
-        <span class="muted">點文字直接修改；點 Logo 或「更換背景圖」上傳新圖片；框框上方有排序、複製、隱藏工具。改完按「儲存」才會上線。</span>
+        <span class="muted">點文字直接修改；點 Logo 或「更換背景圖」上傳新圖片；框框上方有排序、複製、隱藏工具。改完先「儲存草稿」→「預覽草稿」確認 →「發布上線」。</span>
         <span style="flex:1"></span>
         <span id="pageDirty" class="badge">尚無修改</span>
+        <span id="pageDraft" class="badge">沒有未發布的草稿</span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px">
         <button class="btn ghost" type="button" id="pageRevertKey" disabled>還原此區塊預設</button>
-        <button class="btn ghost" type="button" id="pageDiscard">放棄修改</button>
-        <button class="btn primary" type="button" id="pageSave">儲存並上線</button>
+        <button class="btn ghost" type="button" id="pageDiscard">放棄未存的修改</button>
+        <span style="flex:1"></span>
+        <button class="btn primary" type="button" id="pageSave">儲存草稿</button>
+        <button class="btn ghost" type="button" id="pagePreview">預覽草稿</button>
+        <button class="btn orange" type="button" id="pagePublish">發布上線</button>
+        <button class="btn ghost" type="button" id="pageDraftDiscard">捨棄草稿</button>
       </div>
       <div id="pageSelected" class="muted" style="margin-top:8px">尚未選取區塊</div>
       <div id="stylePanel" class="style-panel">
@@ -4842,7 +5162,7 @@ th{
               <div id="seoImageHint" class="muted"></div>
             </div>
             <p class="muted" style="margin:0">
-              修改後按上方「儲存並上線」。Facebook / LINE 會快取舊的預覽，上線後可到
+              修改後按上方「儲存草稿」→「發布上線」。Facebook / LINE 會快取舊的預覽，上線後可到
               Facebook 分享偵錯工具按「重新抓取」更新。
             </p>
           </div>
@@ -4865,6 +5185,33 @@ th{
             </div>
           </div>
 
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="versionPanel">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+        <h2 style="margin:0">版本與還原點</h2>
+        <button class="btn ghost" type="button" id="versionToggle">展開版本</button>
+      </div>
+      <div id="versionBody" style="display:none;margin-top:14px">
+        <p class="muted" style="margin-top:0">
+          每次「發布上線」或還原都會自動存一個完整版本（保留最近 50 個），可以先預覽再還原。
+          標示「還原點」的版本不會被自動刪除，而且只有系統管理員可以還原。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:70px">版本</th>
+                <th style="width:170px">時間</th>
+                <th style="width:220px">操作人</th>
+                <th>說明</th>
+                <th style="width:300px"></th>
+              </tr>
+            </thead>
+            <tbody id="versionRows"></tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -6209,6 +6556,7 @@ function updatePageToolbar() {
   var n = pageDirtyCount();
   document.getElementById("pageDirty").textContent = n ? ("未儲存修改：" + n + " 處") : "尚無修改";
   document.getElementById("pageSave").disabled = !n;
+  if (typeof renderDraftBadge === "function") renderDraftBadge();
 
   var key = pageEditor.selectedKey;
   var overridden = key && ((state.content_keys || []).indexOf(key) >= 0 || pageEditor.dirty[key]);
@@ -6303,6 +6651,7 @@ function setupPageFrame() {
 
   setupLayoutEditing(doc);
   fillSeoForm(doc);
+  loadDraftCount();
 }
 
 function activatePageText(el) {
@@ -6394,7 +6743,7 @@ document.getElementById("pageImageInput").addEventListener("change", async funct
 
     pageEditor.dirty[t.key] = { type: "image", value: data.url };
     updatePageToolbar();
-    flash("圖片已上傳" + (file.size < original ? "（" + fmtSize(original) + " → " + fmtSize(file.size) + "）" : "") + "，按「儲存並上線」後生效。");
+    flash("圖片已上傳" + (file.size < original ? "（" + fmtSize(original) + " → " + fmtSize(file.size) + "）" : "") + "，按「儲存草稿」後再發布上線。");
   } catch (err) {
     flash(err.message, false);
   }
@@ -6970,6 +7319,43 @@ function updateSelectedBox(patch) {
 })();
 
 
+var NL = String.fromCharCode(10);
+
+// ===== 草稿 / 預覽 / 發布 =====
+
+var draftState = { count: 0 };
+
+function renderDraftBadge() {
+  var badge = document.getElementById("pageDraft");
+  if (!badge) return;
+  badge.textContent = draftState.count ? ("草稿：" + draftState.count + " 處未發布") : "沒有未發布的草稿";
+  badge.style.background = draftState.count ? "#fff3e6" : "";
+  badge.style.color = draftState.count ? "#b45309" : "";
+  document.getElementById("pagePublish").disabled = !draftState.count && !pageDirtyCount();
+  document.getElementById("pageDraftDiscard").disabled = !draftState.count;
+}
+
+async function loadDraftCount() {
+  try {
+    var d = await api("/api/admin/content/draft");
+    draftState.count = d.count || 0;
+  } catch (err) {
+    draftState.count = 0;
+  }
+  renderDraftBadge();
+}
+
+async function saveDraftNow() {
+  var data = await api("/api/admin/content/draft", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ changes: pageEditor.dirty })
+  });
+  pageEditor.dirty = {};
+  draftState.count = data.count || 0;
+  return data;
+}
+
 document.getElementById("pageSave").addEventListener("click", async function() {
   if (!pageDirtyCount()) return;
   var btn = this;
@@ -6977,22 +7363,198 @@ document.getElementById("pageSave").addEventListener("click", async function() {
   btn.textContent = "儲存中…";
 
   try {
-    var data = await api("/api/admin/content", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ changes: pageEditor.dirty })
-    });
-    flash(data.message || "已儲存。");
-    await load();
+    var data = await saveDraftNow();
+    flash((data.message || "草稿已儲存。") + "按「預覽草稿」確認後，再按「發布上線」。");
     loadPageFrame();
-    if (document.getElementById("historyBody").style.display !== "none") loadHistory();
   } catch (err) {
     flash(err.message, false);
   } finally {
-    btn.textContent = "儲存並上線";
+    btn.textContent = "儲存草稿";
     updatePageToolbar();
   }
 });
+
+document.getElementById("pagePreview").addEventListener("click", async function() {
+  if (pageDirtyCount()) {
+    if (!confirm("有尚未儲存的修改，要先存成草稿再預覽嗎？")) return;
+    try {
+      await saveDraftNow();
+      loadPageFrame();
+    } catch (err) {
+      flash(err.message, false);
+      return;
+    }
+  }
+  window.open("/?cms-preview=1&t=" + Date.now(), "_blank");
+});
+
+document.getElementById("pagePublish").addEventListener("click", async function() {
+  var btn = this;
+  if (pageDirtyCount()) {
+    if (!confirm("有尚未儲存的修改，會先存成草稿再一起發布。繼續？")) return;
+    try {
+      await saveDraftNow();
+    } catch (err) {
+      flash(err.message, false);
+      return;
+    }
+  }
+  if (!draftState.count) {
+    flash("目前沒有草稿可以發布。", false);
+    loadPageFrame();
+    return;
+  }
+  var note = prompt("發布上線：共 " + draftState.count + " 處修改。" + NL + "請輸入這次修改的說明（選填，例如：更新服務項目）", "");
+  if (note === null) {
+    loadPageFrame();
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "發布中…";
+  try {
+    var data = await api("/api/admin/content/publish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: note })
+    });
+    flash(data.message || "已發布上線。");
+    await load();
+    loadPageFrame();
+    if (document.getElementById("historyBody").style.display !== "none") loadHistory();
+    if (document.getElementById("versionBody").style.display !== "none") loadVersions();
+  } catch (err) {
+    flash(err.message, false);
+  } finally {
+    btn.textContent = "發布上線";
+    loadDraftCount();
+  }
+});
+
+document.getElementById("pageDraftDiscard").addEventListener("click", async function() {
+  if (!confirm("捨棄所有尚未發布的草稿？（正式網站不受影響）")) return;
+  try {
+    await api("/api/admin/content/draft", { method: "DELETE" });
+    flash("草稿已捨棄。");
+    loadPageFrame();
+  } catch (err) {
+    flash(err.message, false);
+  }
+});
+
+
+// ===== 版本與還原點 =====
+
+var versionState = { items: [], current: null };
+
+var VERSION_SOURCE_LABEL = { publish: "發布", restore: "還原", revert: "修改紀錄還原", edit: "儲存", baseline: "系統" };
+
+document.getElementById("versionToggle").addEventListener("click", function() {
+  var body = document.getElementById("versionBody");
+  var open = body.style.display === "none";
+  body.style.display = open ? "" : "none";
+  this.textContent = open ? "收合版本" : "展開版本";
+  if (open) loadVersions();
+});
+
+async function loadVersions() {
+  try {
+    var data = await api("/api/admin/content/versions");
+    versionState.items = data.items || [];
+    versionState.current = data.current_id;
+    renderVersions();
+  } catch (err) {
+    flash(err.message, false);
+  }
+}
+
+function renderVersions() {
+  var isSuper = !!(state.me && state.me.is_super);
+  var tbody = document.getElementById("versionRows");
+  tbody.innerHTML = versionState.items.length ? "" : '<tr><td colspan="5" class="muted">尚無版本。</td></tr>';
+
+  versionState.items.forEach(function(v) {
+    var tr = document.createElement("tr");
+    if (v.is_baseline) tr.style.background = "#fff8f0";
+    var tags = "";
+    if (v.is_baseline) tags += '<span class="badge" style="background:#FF7000;color:#fff">還原點</span> ';
+    if (v.id === versionState.current) tags += '<span class="badge" style="background:#0A0AA3;color:#fff">目前上線</span> ';
+
+    var actions = '<button class="btn ghost sm" type="button" data-ver-preview="' + v.id + '">預覽</button> ';
+    if (!v.is_baseline || isSuper) {
+      actions += '<button class="btn ' + (v.is_baseline ? "danger" : "ghost") + ' sm" type="button" data-ver-restore="' + v.id + '">還原到此版本</button> ';
+    } else {
+      actions += '<span class="muted" style="font-size:12px">只有系統管理員可還原</span> ';
+    }
+    if (isSuper && v.source !== "baseline") {
+      actions += '<button class="btn ghost sm" type="button" data-ver-base="' + v.id + '">' + (v.is_baseline ? "取消還原點" : "設為還原點") + "</button>";
+    }
+
+    tr.innerHTML =
+      "<td><strong>#" + v.id + "</strong></td>" +
+      "<td>" + esc(v.source === "baseline" && v.created_by === "system" ? twTime(v.created_at) : twTime(v.created_at)) + "</td>" +
+      "<td>" + esc(v.created_by === "system" ? "系統" : v.created_by) + "</td>" +
+      "<td>" + tags + esc(v.note || "") + ' <span class="muted">（' + (VERSION_SOURCE_LABEL[v.source] || v.source) + "，" + v.item_count + " 項設定）</span></td>" +
+      "<td>" + actions + "</td>";
+    tbody.appendChild(tr);
+  });
+
+  tbody.querySelectorAll("[data-ver-preview]").forEach(function(b) {
+    b.onclick = function() { window.open("/?cms-version=" + b.getAttribute("data-ver-preview") + "&t=" + Date.now(), "_blank"); };
+  });
+  tbody.querySelectorAll("[data-ver-restore]").forEach(function(b) {
+    b.onclick = function() { restoreVersionUi(Number(b.getAttribute("data-ver-restore"))); };
+  });
+  tbody.querySelectorAll("[data-ver-base]").forEach(function(b) {
+    b.onclick = function() { toggleBaselineUi(Number(b.getAttribute("data-ver-base"))); };
+  });
+}
+
+async function restoreVersionUi(id) {
+  var v = versionState.items.find(function(x) { return x.id === id; });
+  if (!v) return;
+  var msg = "將正式網站還原到" + (v.is_baseline ? "還原點" : "版本") + " #" + id + (v.note ? "（" + v.note + "）" : "") + "？" + NL + NL + "" +
+    "・會立即上線" + NL + "・目前的內容會先自動存成一個版本，之後可以再還原回來";
+  if (draftState.count) msg += NL + "・注意：還有 " + draftState.count + " 處草稿尚未發布，草稿不會被清除，之後發布會蓋過還原的內容";
+  if (!confirm(msg)) return;
+  if (v.is_baseline && !confirm("再次確認：還原點會把網站改回當時的樣子，確定要還原？")) return;
+
+  try {
+    var data = await api("/api/admin/content/versions/" + id + "/restore", { method: "POST" });
+    flash(data.message || "已還原。");
+    await load();
+    loadPageFrame();
+    loadVersions();
+    if (document.getElementById("historyBody").style.display !== "none") loadHistory();
+  } catch (err) {
+    flash(err.message, false);
+  }
+}
+
+async function toggleBaselineUi(id) {
+  var v = versionState.items.find(function(x) { return x.id === id; });
+  if (!v) return;
+  var body = { on: !v.is_baseline };
+  if (!v.is_baseline) {
+    var note = prompt("設為還原點（不會被自動刪除，只有系統管理員能還原）。" + NL + "還原點名稱：", v.note || "");
+    if (note === null) return;
+    body.note = note;
+  } else if (!confirm("取消這個還原點？取消後它會變成一般版本，超過 50 個版本時會被自動刪除。")) {
+    return;
+  }
+  try {
+    var data = await api("/api/admin/content/versions/" + id + "/baseline", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    flash(data.message);
+    loadVersions();
+  } catch (err) {
+    flash(err.message, false);
+  }
+}
+
 
 document.getElementById("pageDiscard").addEventListener("click", function() {
   if (pageDirtyCount() && !confirm("確定放棄所有未儲存的修改？")) return;
@@ -7005,7 +7567,7 @@ document.getElementById("pageRevertKey").addEventListener("click", function() {
   if (!confirm("將「" + key + "」還原為網站原始內容？（按儲存後生效）")) return;
   pageEditor.dirty[key] = null;
   updatePageToolbar();
-  flash("已標記還原，按「儲存並上線」後生效。");
+  flash("已標記還原，按「儲存草稿」後再發布上線。");
 });
 
 window.addEventListener("beforeunload", function(e) {
