@@ -80,7 +80,8 @@ export default {
     }
 
     // ===== 稽核紀錄：所有後台寫入操作（誰、何時、做了什麼、結果）=====
-    if (me && request.method !== "GET") {
+    // 編輯鎖的心跳每分鐘一次，不寫進操作紀錄
+    if (me && request.method !== "GET" && !path.startsWith("/api/admin/content/lock")) {
       const summary = await auditSummary(request);
       const response = await handle();
       ctx?.waitUntil?.(writeAudit(env, me.email, request.method, path, response.status, summary));
@@ -255,6 +256,27 @@ export default {
       }
 
       // ===== 頁面內容 =====
+      if (path === "/api/admin/content/lock" && request.method === "GET") {
+        return getLock(env, me);
+      }
+
+      if (path === "/api/admin/content/lock" && request.method === "POST") {
+        return acquireLock(request, env, me);
+      }
+
+      if (path === "/api/admin/content/lock/release" && request.method === "POST") {
+        return releaseLock(env, me);
+      }
+
+      // 會改到草稿或正式內容的操作，都要先拿到編輯鎖（同一時間只有一個人）
+      if (
+        path.startsWith("/api/admin/content") && request.method !== "GET" &&
+        path !== "/api/admin/content/image" && !/\/baseline$/.test(path)
+      ) {
+        const busy = await requireEditLock(env, me);
+        if (busy) return busy;
+      }
+
       if (path === "/api/admin/content" && request.method === "PUT") {
         return saveSiteContent(request, env, me);
       }
@@ -2550,6 +2572,86 @@ async function versionContent(env, id) {
 
 const VERSION_SOURCE_NOTE = { edit: "直接儲存", publish: "發布草稿", revert: "從修改紀錄還原", restore: "還原版本" };
 
+// ===== 頁面編輯鎖：同一時間只有一個人可以編輯頁面內容 =====
+// 編輯器每分鐘回報一次（心跳）；超過 LOCK_TTL_MIN 分鐘沒有心跳就自動釋放。
+// 系統管理員可以強制接手（例如有人開著分頁就離開）。
+
+const LOCK_TTL_MIN = 3;
+let lockTableReady = false;
+
+async function ensureLockTable(env) {
+  if (lockTableReady) return;
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS page_edit_lock (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      email TEXT,
+      name TEXT,
+      acquired_at TEXT,
+      heartbeat_at TEXT
+    )
+  `).run();
+  await env.DB.prepare("INSERT OR IGNORE INTO page_edit_lock (id) VALUES (1)").run();
+  lockTableReady = true;
+}
+
+async function readLock(env) {
+  await ensureLockTable(env);
+  const r = await env.DB.prepare(`
+    SELECT email, name, acquired_at, heartbeat_at,
+      (email IS NOT NULL AND heartbeat_at >= datetime('now', ?)) AS active
+    FROM page_edit_lock WHERE id = 1
+  `).bind(`-${LOCK_TTL_MIN} minutes`).first();
+  return r && r.active ? { email: r.email, name: r.name, acquired_at: r.acquired_at, heartbeat_at: r.heartbeat_at } : null;
+}
+
+// 取得或續約編輯鎖；成功回傳 true
+async function tryAcquireLock(env, me, force) {
+  await ensureLockTable(env);
+  const res = await env.DB.prepare(`
+    UPDATE page_edit_lock SET
+      acquired_at = CASE WHEN email = ? AND heartbeat_at >= datetime('now', ?) THEN acquired_at ELSE CURRENT_TIMESTAMP END,
+      email = ?, name = ?, heartbeat_at = CURRENT_TIMESTAMP
+    WHERE id = 1 AND (? = 1 OR email IS NULL OR email = ? OR heartbeat_at < datetime('now', ?))
+  `).bind(me.email, `-${LOCK_TTL_MIN} minutes`, me.email, me.name || "", force ? 1 : 0, me.email, `-${LOCK_TTL_MIN} minutes`).run();
+  return (res.meta?.changes || 0) === 1;
+}
+
+function lockBusyResponse(holder) {
+  return json({
+    ok: false,
+    locked: true,
+    holder,
+    message: `${holder.name || holder.email} 正在編輯頁面內容，同一時間只能一個人編輯。請等對方完成，或請系統管理員接手。`
+  }, 423);
+}
+
+// 寫入頁面內容前呼叫：別人正在編輯就擋下；否則順便取得 / 續約編輯鎖
+async function requireEditLock(env, me) {
+  if (await tryAcquireLock(env, me, false)) return null;
+  return lockBusyResponse(await readLock(env));
+}
+
+async function getLock(env, me) {
+  const holder = await readLock(env);
+  return json({ ok: true, holder, mine: !!holder && holder.email === me.email, ttl_min: LOCK_TTL_MIN });
+}
+
+async function acquireLock(request, env, me) {
+  const body = await request.json().catch(() => ({}));
+  const force = body.force === true;
+  if (force && !me.is_super) return json({ ok: false, message: "只有系統管理員可以強制接手。" }, 403);
+  const before = force ? await readLock(env) : null;
+  if (!(await tryAcquireLock(env, me, force))) return lockBusyResponse(await readLock(env));
+  if (force && before && before.email !== me.email) console.log("edit lock taken over", me.email, "from", before.email);
+  return json({ ok: true, holder: await readLock(env), mine: true, ttl_min: LOCK_TTL_MIN });
+}
+
+async function releaseLock(env, me) {
+  await ensureLockTable(env);
+  await env.DB.prepare("UPDATE page_edit_lock SET email = NULL, name = NULL WHERE id = 1 AND email = ?").bind(me.email).run();
+  return json({ ok: true });
+}
+
 // 修改紀錄：依批次分組，最近的在前
 async function listContentHistory(url, env) {
   await ensureSiteContentTable(env);
@@ -3978,6 +4080,10 @@ th{
   .style-row input[type=color] { width: 34px; height: 26px; padding: 0; border: 1px solid var(--line); border-radius: 6px; }
   .style-row .val { font-size: 12px; color: var(--muted); min-width: 30px; }
   #pageToolbarPanel { position: sticky; top: 0; z-index: 30; }
+
+  .lock-bar { margin-top: 10px; padding: 10px 12px; border-radius: 10px; background: #fff3e6; color: #8a3b00; font-weight: 700; }
+  .lock-cover { position: absolute; inset: 0; z-index: 5; background: rgba(245,246,251,.55); cursor: not-allowed; display: flex; align-items: flex-start; justify-content: center; }
+  .lock-cover-msg { margin-top: 24px; background: #fff; border-radius: 12px; padding: 12px 18px; box-shadow: 0 10px 30px rgba(13,4,95,.18); font-weight: 700; color: #8a3b00; max-width: 80%; }
 </style>
 
 </head>
@@ -5032,6 +5138,7 @@ th{
         <button class="btn ghost" type="button" id="pageDraftDiscard">捨棄草稿</button>
       </div>
       <div id="pageSelected" class="muted" style="margin-top:8px">尚未選取區塊</div>
+      <div id="pageLockBar" class="lock-bar" style="display:none"></div>
       <div id="stylePanel" class="style-panel">
         <div class="style-head" id="styleHead">
           <strong>樣式與框框</strong>
@@ -5227,7 +5334,8 @@ th{
       </div>
     </div>
 
-    <div class="panel" style="padding:0;overflow:hidden">
+    <div class="panel" style="padding:0;overflow:hidden;position:relative">
+      <div id="pageLockCover" class="lock-cover" style="display:none"></div>
       <iframe
         id="pageFrame"
         title="首頁編輯預覽"
@@ -6557,6 +6665,11 @@ function updatePageToolbar() {
   document.getElementById("pageDirty").textContent = n ? ("未儲存修改：" + n + " 處") : "尚無修改";
   document.getElementById("pageSave").disabled = !n;
   if (typeof renderDraftBadge === "function") renderDraftBadge();
+  if (typeof pageLock !== "undefined" && !pageLock.mine) {
+    ["pageSave", "pagePublish", "pageDraftDiscard", "pageRevertKey"].forEach(function(id) {
+      document.getElementById(id).disabled = true;
+    });
+  }
 
   var key = pageEditor.selectedKey;
   var overridden = key && ((state.content_keys || []).indexOf(key) >= 0 || pageEditor.dirty[key]);
@@ -6650,6 +6763,8 @@ function setupPageFrame() {
   doc.addEventListener("submit", function(e) { e.preventDefault(); }, true);
 
   setupLayoutEditing(doc);
+  doc.addEventListener("mousemove", markPageActivity, { passive: true });
+  doc.addEventListener("keydown", markPageActivity);
   fillSeoForm(doc);
   loadDraftCount();
 }
@@ -7331,8 +7446,9 @@ function renderDraftBadge() {
   badge.textContent = draftState.count ? ("草稿：" + draftState.count + " 處未發布") : "沒有未發布的草稿";
   badge.style.background = draftState.count ? "#fff3e6" : "";
   badge.style.color = draftState.count ? "#b45309" : "";
-  document.getElementById("pagePublish").disabled = !draftState.count && !pageDirtyCount();
-  document.getElementById("pageDraftDiscard").disabled = !draftState.count;
+  var locked = typeof pageLock !== "undefined" && !pageLock.mine;
+  document.getElementById("pagePublish").disabled = locked || (!draftState.count && !pageDirtyCount());
+  document.getElementById("pageDraftDiscard").disabled = locked || !draftState.count;
 }
 
 async function loadDraftCount() {
@@ -7577,8 +7693,118 @@ window.addEventListener("beforeunload", function(e) {
   }
 });
 
+// ===== 編輯鎖（同一時間只有一個人可以編輯頁面內容）=====
+
+var pageLock = { mine: false, holder: null, lastActivity: Date.now(), timer: null, idleReleased: false };
+var LOCK_IDLE_MS = 15 * 60 * 1000;
+
+function markPageActivity() {
+  pageLock.lastActivity = Date.now();
+}
+
+document.addEventListener("mousemove", markPageActivity, { passive: true });
+document.addEventListener("keydown", markPageActivity);
+
+function renderPageLock() {
+  var bar = document.getElementById("pageLockBar");
+  var cover = document.getElementById("pageLockCover");
+  var isSuper = !!(state.me && state.me.is_super);
+  var h = pageLock.holder;
+
+  ["pageSave", "pagePublish", "pageDraftDiscard", "pageRevertKey"].forEach(function(id) {
+    var b = document.getElementById(id);
+    if (b && !pageLock.mine) b.disabled = true;
+  });
+
+  if (pageLock.mine) {
+    bar.style.display = "none";
+    cover.style.display = "none";
+    return;
+  }
+
+  var who = h ? esc(h.name || h.email) + "（" + esc(h.email) + "）" : "";
+  var text = pageLock.idleReleased
+    ? "你閒置超過 15 分鐘，編輯權已自動釋放，讓其他人可以編輯。"
+    : (h ? who + " 正在編輯頁面內容（最後活動 " + esc(twTime(h.heartbeat_at)) + "）。同一時間只能一個人編輯，你目前只能檢視。" : "正在取得編輯權…");
+
+  bar.style.display = "";
+  bar.innerHTML = text + ' <button class="btn ghost sm" type="button" id="lockRetry">' + (pageLock.idleReleased ? "繼續編輯" : "重新檢查") + "</button>" +
+    (isSuper && h && !pageLock.idleReleased ? ' <button class="btn danger sm" type="button" id="lockForce">強制接手</button>' : "");
+  cover.style.display = "";
+  cover.innerHTML = '<div class="lock-cover-msg">' + text + "</div>";
+
+  document.getElementById("lockRetry").onclick = function() {
+    pageLock.idleReleased = false;
+    markPageActivity();
+    acquirePageLock(false);
+  };
+  var force = document.getElementById("lockForce");
+  if (force) {
+    force.onclick = function() {
+      if (!confirm("強制接手編輯權？" + (h ? h.email : "") + " 尚未儲存的修改將無法儲存。")) return;
+      acquirePageLock(true);
+    };
+  }
+}
+
+async function acquirePageLock(force) {
+  try {
+    var res = await fetch("/api/admin/content/lock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ force: !!force })
+    });
+    var data = await res.json().catch(function() { return {}; });
+    var wasMine = pageLock.mine;
+    pageLock.mine = res.ok && data.mine;
+    pageLock.holder = data.holder || null;
+    if (wasMine && !pageLock.mine) {
+      flash("編輯權已被 " + (pageLock.holder ? pageLock.holder.email : "其他人") + " 接手，你尚未儲存的修改無法儲存。", false);
+    }
+  } catch (err) {
+    console.warn("lock failed", err);
+  }
+  renderPageLock();
+  updatePageToolbar();
+}
+
+function releasePageLock() {
+  if (!pageLock.mine) return;
+  pageLock.mine = false;
+  try {
+    fetch("/api/admin/content/lock/release", { method: "POST", keepalive: true, credentials: "same-origin" });
+  } catch (e) {}
+}
+
+function startPageLockLoop() {
+  if (pageLock.timer) return;
+  pageLock.timer = setInterval(function() {
+    var onPages = document.getElementById("pages").classList.contains("active");
+    if (!onPages) return;
+    if (pageLock.mine && Date.now() - pageLock.lastActivity > LOCK_IDLE_MS && !pageDirtyCount()) {
+      releasePageLock();
+      pageLock.idleReleased = true;
+      pageLock.holder = null;
+      renderPageLock();
+      updatePageToolbar();
+      return;
+    }
+    if (!pageLock.idleReleased) acquirePageLock(false);
+  }, 60 * 1000);
+}
+
+window.addEventListener("pagehide", releasePageLock);
+
+
 document.querySelector('.nav button[data-target="pages"]').addEventListener("click", function() {
   if (!pageEditor.loaded) loadPageFrame();
+  if (!pageLock.mine) {
+    pageLock.idleReleased = false;
+    markPageActivity();
+    acquirePageLock(false);
+  }
+  startPageLockLoop();
 });
 
 
