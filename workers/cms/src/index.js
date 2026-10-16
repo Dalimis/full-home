@@ -4120,6 +4120,24 @@ th{
     </button>
 
     <button
+      data-target="seo"
+    >
+      SEO 與分享
+    </button>
+
+    <button
+      data-target="versions"
+    >
+      版本與還原點
+    </button>
+
+    <button
+      data-target="history"
+    >
+      修改紀錄
+    </button>
+
+    <button
       data-target="contacts"
     >
       聯絡表單
@@ -5234,13 +5252,42 @@ th{
       <input type="file" id="pageImageInput" accept="image/jpeg,image/png,image/webp" style="display:none">
     </div>
 
+    <div class="panel" style="padding:0;overflow:hidden;position:relative">
+      <div id="pageLockCover" class="lock-cover" style="display:none"></div>
+      <iframe
+        id="pageFrame"
+        title="首頁編輯預覽"
+        style="width:100%;height:78vh;border:0;display:block;background:#fff"
+      ></iframe>
+    </div>
+
+  </section>
+
+  <section
+    id="seo"
+    class="section"
+  >
+
+    <div class="panel" style="padding:16px 20px">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <strong style="color:var(--blue)">SEO 與分享預覽</strong>
+        <span id="seoDirty" class="badge">尚無修改</span>
+        <span id="seoDraft" class="badge">沒有未發布的草稿</span>
+        <span style="flex:1"></span>
+        <button class="btn primary" type="button" id="seoSave">儲存草稿</button>
+        <button class="btn ghost" type="button" id="seoPreview">預覽草稿</button>
+        <button class="btn orange" type="button" id="seoPublish">發布上線</button>
+      </div>
+      <div id="seoLockNote" class="lock-bar" style="display:none"></div>
+    </div>
+
     <div class="panel" id="seoPanel">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
         <h2 style="margin:0">SEO 與分享預覽</h2>
-        <button class="btn ghost" type="button" id="seoToggle">展開設定</button>
+        <button class="btn ghost" type="button" id="seoToggle" style="display:none">展開設定</button>
       </div>
 
-      <div id="seoBody" style="display:none;margin-top:16px">
+      <div id="seoBody" style="margin-top:16px">
         <div class="seo-grid">
 
           <div class="grid2" style="grid-template-columns:1fr">
@@ -5269,7 +5316,7 @@ th{
               <div id="seoImageHint" class="muted"></div>
             </div>
             <p class="muted" style="margin:0">
-              修改後按上方「儲存草稿」→「發布上線」。Facebook / LINE 會快取舊的預覽，上線後可到
+              修改後按上方「儲存草稿」→「預覽草稿」→「發布上線」（和頁面內容共用同一份草稿）。Facebook / LINE 會快取舊的預覽，上線後可到
               Facebook 分享偵錯工具按「重新抓取」更新。
             </p>
           </div>
@@ -5296,12 +5343,20 @@ th{
       </div>
     </div>
 
+
+  </section>
+
+  <section
+    id="versions"
+    class="section"
+  >
+
     <div class="panel" id="versionPanel">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
         <h2 style="margin:0">版本與還原點</h2>
-        <button class="btn ghost" type="button" id="versionToggle">展開版本</button>
+        <button class="btn ghost" type="button" id="versionToggle" style="display:none">展開版本</button>
       </div>
-      <div id="versionBody" style="display:none;margin-top:14px">
+      <div id="versionBody" style="margin-top:14px">
         <p class="muted" style="margin-top:0">
           每次「發布上線」或還原都會自動存一個完整版本（保留最近 50 個），可以先預覽再還原。
           標示「還原點」的版本不會被自動刪除，而且只有系統管理員可以還原。
@@ -5323,25 +5378,25 @@ th{
       </div>
     </div>
 
+
+  </section>
+
+  <section
+    id="history"
+    class="section"
+  >
+
     <div class="panel" id="historyPanel">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
         <h2 style="margin:0">修改紀錄</h2>
-        <button class="btn ghost" type="button" id="historyToggle">展開紀錄</button>
+        <button class="btn ghost" type="button" id="historyToggle" style="display:none">展開紀錄</button>
       </div>
-      <div id="historyBody" style="display:none;margin-top:14px">
+      <div id="historyBody" style="margin-top:14px">
         <p class="muted" style="margin-top:0">最近 40 次儲存。可以整次還原，或只還原其中一個區塊；還原也會留下一筆紀錄。</p>
         <div id="historyList"></div>
       </div>
     </div>
 
-    <div class="panel" style="padding:0;overflow:hidden;position:relative">
-      <div id="pageLockCover" class="lock-cover" style="display:none"></div>
-      <iframe
-        id="pageFrame"
-        title="首頁編輯預覽"
-        style="width:100%;height:78vh;border:0;display:block;background:#fff"
-      ></iframe>
-    </div>
 
   </section>
 
@@ -6462,6 +6517,9 @@ async function removeDoc(id) {
 
 var SECTION_PERMISSION = {
   pages: "pages",
+  seo: "pages",
+  versions: "pages",
+  history: "pages",
   contacts: "contacts",
   backups: "users",
   audit: "users",
@@ -6670,6 +6728,7 @@ function updatePageToolbar() {
       document.getElementById(id).disabled = true;
     });
   }
+  syncSeoToolbar();
 
   var key = pageEditor.selectedKey;
   var overridden = key && ((state.content_keys || []).indexOf(key) >= 0 || pageEditor.dirty[key]);
@@ -7446,6 +7505,7 @@ function renderDraftBadge() {
   badge.textContent = draftState.count ? ("草稿：" + draftState.count + " 處未發布") : "沒有未發布的草稿";
   badge.style.background = draftState.count ? "#fff3e6" : "";
   badge.style.color = draftState.count ? "#b45309" : "";
+  if (typeof syncSeoToolbar === "function") setTimeout(syncSeoToolbar, 0);
   var locked = typeof pageLock !== "undefined" && !pageLock.mine;
   document.getElementById("pagePublish").disabled = locked || (!draftState.count && !pageDirtyCount());
   document.getElementById("pageDraftDiscard").disabled = locked || !draftState.count;
@@ -7693,6 +7753,26 @@ window.addEventListener("beforeunload", function(e) {
   }
 });
 
+// ===== SEO 頁面的工具列（和頁面內容共用草稿、編輯鎖）=====
+
+function syncSeoToolbar() {
+  var d = document.getElementById("seoDirty");
+  if (!d) return;
+  d.textContent = document.getElementById("pageDirty").textContent;
+  document.getElementById("seoDraft").textContent = document.getElementById("pageDraft").textContent;
+  document.getElementById("seoDraft").style.cssText = document.getElementById("pageDraft").style.cssText;
+  document.getElementById("seoSave").disabled = document.getElementById("pageSave").disabled;
+  document.getElementById("seoPublish").disabled = document.getElementById("pagePublish").disabled;
+  var note = document.getElementById("seoLockNote");
+  var bar = document.getElementById("pageLockBar");
+  note.style.display = bar.style.display;
+  note.textContent = bar.style.display === "none" ? "" : (bar.firstChild ? bar.textContent.replace(/重新檢查|繼續編輯|強制接手/g, "").trim() + "（請到「頁面內容」處理）" : "");
+}
+
+document.getElementById("seoSave").addEventListener("click", function() { document.getElementById("pageSave").click(); });
+document.getElementById("seoPreview").addEventListener("click", function() { document.getElementById("pagePreview").click(); });
+document.getElementById("seoPublish").addEventListener("click", function() { document.getElementById("pagePublish").click(); });
+
 // ===== 編輯鎖（同一時間只有一個人可以編輯頁面內容）=====
 
 var pageLock = { mine: false, holder: null, lastActivity: Date.now(), timer: null, idleReleased: false };
@@ -7719,6 +7799,7 @@ function renderPageLock() {
   if (pageLock.mine) {
     bar.style.display = "none";
     cover.style.display = "none";
+    syncSeoToolbar();
     return;
   }
 
@@ -7738,6 +7819,7 @@ function renderPageLock() {
     markPageActivity();
     acquirePageLock(false);
   };
+  syncSeoToolbar();
   var force = document.getElementById("lockForce");
   if (force) {
     force.onclick = function() {
@@ -7780,7 +7862,8 @@ function releasePageLock() {
 function startPageLockLoop() {
   if (pageLock.timer) return;
   pageLock.timer = setInterval(function() {
-    var onPages = document.getElementById("pages").classList.contains("active");
+    var onPages = document.getElementById("pages").classList.contains("active") ||
+      document.getElementById("seo").classList.contains("active");
     if (!onPages) return;
     if (pageLock.mine && Date.now() - pageLock.lastActivity > LOCK_IDLE_MS && !pageDirtyCount()) {
       releasePageLock();
@@ -7797,7 +7880,7 @@ function startPageLockLoop() {
 window.addEventListener("pagehide", releasePageLock);
 
 
-document.querySelector('.nav button[data-target="pages"]').addEventListener("click", function() {
+function enterPageEditing() {
   if (!pageEditor.loaded) loadPageFrame();
   if (!pageLock.mine) {
     pageLock.idleReleased = false;
@@ -7805,7 +7888,12 @@ document.querySelector('.nav button[data-target="pages"]').addEventListener("cli
     acquirePageLock(false);
   }
   startPageLockLoop();
-});
+}
+
+document.querySelector('.nav button[data-target="pages"]').addEventListener("click", enterPageEditing);
+document.querySelector('.nav button[data-target="seo"]').addEventListener("click", enterPageEditing);
+document.querySelector('.nav button[data-target="versions"]').addEventListener("click", function() { loadVersions(); });
+document.querySelector('.nav button[data-target="history"]').addEventListener("click", function() { loadHistory(); });
 
 
 // ===== 聯絡表單 =====
