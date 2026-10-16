@@ -98,7 +98,9 @@ export default {
       // 首頁：把後台編輯過的文字/圖片套進 HTML（HTMLRewriter，搜尋引擎也看得到）
       if (path === "/" && request.method === "GET") {
         ctx?.passThroughOnException?.();
-        return renderHomepage(request, env);
+        // 編輯器模式（?cms-edit=1）且已通過 Access 登入：隱藏的框框也輸出（標記 data-cms-hidden），並附上目前樣式
+        const editMode = url.searchParams.has("cms-edit") && (await verifyAccess(request, env)).ok;
+        return renderHomepage(request, env, editMode);
       }
 
       // 搜尋引擎：sitemap 依後台資料的最後更新時間產生；Worker 失敗時由 Pages 的靜態檔接手
@@ -2161,48 +2163,52 @@ async function applyContentChanges(env, me, changes, source) {
   const keys = Object.keys(changes);
 
   if (!keys.length) return json({ ok: false, message: "沒有需要儲存的修改。" }, 400);
-  if (keys.length > 300) return json({ ok: false, message: "一次修改太多項目。" }, 400);
+  if (keys.length > 400) return json({ ok: false, message: "一次修改太多項目。" }, 400);
 
-  const stmts = [];
+  // 先把每一項整理成要寫入的值（null = 刪除，恢復網站原始內容 / 樣式）
+  const resolved = new Map();
 
   for (const key of keys) {
-    if (!CONTENT_KEY_RE.test(key) || key.length > 60) {
+    if (!CONTENT_KEY_RE.test(key) || key.length > 80) {
       return json({ ok: false, message: `欄位代碼不正確：${key}` }, 400);
     }
 
     const c = changes[key];
 
     if (c === null) {
-      stmts.push(env.DB.prepare("DELETE FROM site_content WHERE key = ?").bind(key));
+      resolved.set(key, null);
       continue;
     }
 
-    let type, value;
-
     if (c.type === "text") {
-      type = "text";
-      value = sanitizeInlineHtml(c.value);
+      const value = sanitizeInlineHtml(c.value);
       if (!value) return json({ ok: false, message: `「${key}」不可空白；要恢復原文請用「還原預設」。` }, 400);
+      resolved.set(key, { type: "text", value });
     } else if (c.type === "plain") {
       // SEO 標題/描述：純文字，不允許任何 HTML
-      type = "plain";
-      value = String(c.value ?? "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim().slice(0, SEO_MAX[key] || 300);
+      const value = String(c.value ?? "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim().slice(0, SEO_MAX[key] || 300);
       if (!value) return json({ ok: false, message: `「${key}」不可空白；要恢復預設請用「還原預設」。` }, 400);
+      resolved.set(key, { type: "plain", value });
     } else if (c.type === "image") {
-      type = "image";
-      value = String(c.value || "");
+      const value = String(c.value || "");
       if (!MEDIA_URL_RE.test(value)) return json({ ok: false, message: "圖片網址不正確。" }, 400);
+      resolved.set(key, { type: "image", value });
+    } else if (c.type === "layout") {
+      if (!key.startsWith("layout.")) return json({ ok: false, message: `欄位代碼不正確：${key}` }, 400);
+      const norm = normalizeLayout(parseJsonValue(c.value), key.slice(7));
+      if (!norm) return json({ ok: false, message: "區塊排列資料不正確。" }, 400);
+      resolved.set(key, { type: "layout", value: JSON.stringify(norm) });
+    } else if (c.type === "tstyle") {
+      if (!key.startsWith("style.")) return json({ ok: false, message: `欄位代碼不正確：${key}` }, 400);
+      const norm = normalizeTextStyle(parseJsonValue(c.value));
+      resolved.set(key, norm ? { type: "tstyle", value: JSON.stringify(norm) } : null);
+    } else if (c.type === "bstyle") {
+      if (!key.startsWith("bstyle.")) return json({ ok: false, message: `欄位代碼不正確：${key}` }, 400);
+      const norm = normalizeBoxStyle(parseJsonValue(c.value));
+      resolved.set(key, norm ? { type: "bstyle", value: JSON.stringify(norm) } : null);
     } else {
       return json({ ok: false, message: "內容類型不正確。" }, 400);
     }
-
-    stmts.push(env.DB.prepare(`
-      INSERT INTO site_content (key, type, value, updated_at, updated_by)
-      VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
-      ON CONFLICT(key) DO UPDATE SET
-        type = excluded.type, value = excluded.value,
-        updated_at = CURRENT_TIMESTAMP, updated_by = excluded.updated_by
-    `).bind(key, type, value, me.email));
   }
 
   // 修改前的值
@@ -2212,28 +2218,40 @@ async function applyContentChanges(env, me, changes, source) {
       .bind(...keys).all()).results || []).map((r) => [r.key, r])
   );
 
+  const stmts = [];
   const batchId = crypto.randomUUID();
-  for (const key of keys) {
-    const oldRow = before.get(key) || null;
-    const c = changes[key];
-    const newType = c === null ? null : (c.type === "text" ? "text" : c.type === "plain" ? "plain" : "image");
-    const newValue = c === null ? null
-      : newType === "text" ? sanitizeInlineHtml(c.value)
-      : newType === "plain" ? String(c.value ?? "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim().slice(0, SEO_MAX[key] || 300)
-      : String(c.value);
+  let changed = 0;
 
-    // 沒有實際變化的不記錄
-    if ((oldRow ? oldRow.value : null) === newValue) continue;
+  for (const key of keys) {
+    const next = resolved.get(key);
+    const oldRow = before.get(key) || null;
+
+    // 沒有實際變化的不寫入、不記錄
+    if ((oldRow ? oldRow.value : null) === (next ? next.value : null)) continue;
+    changed++;
+
+    if (next === null) {
+      stmts.push(env.DB.prepare("DELETE FROM site_content WHERE key = ?").bind(key));
+    } else {
+      stmts.push(env.DB.prepare(`
+        INSERT INTO site_content (key, type, value, updated_at, updated_by)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+        ON CONFLICT(key) DO UPDATE SET
+          type = excluded.type, value = excluded.value,
+          updated_at = CURRENT_TIMESTAMP, updated_by = excluded.updated_by
+      `).bind(key, next.type, next.value, me.email));
+    }
 
     stmts.push(env.DB.prepare(`
       INSERT INTO site_content_history (batch_id, source, key, old_type, old_value, new_type, new_value, changed_by)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(batchId, source, key, oldRow ? oldRow.type : null, oldRow ? oldRow.value : null, newType, newValue, me.email));
+    `).bind(batchId, source, key, oldRow ? oldRow.type : null, oldRow ? oldRow.value : null,
+      next ? next.type : null, next ? next.value : null, me.email));
   }
 
-  await env.DB.batch(stmts);
-  console.log("site content saved", me.email, source, keys.join(","));
-  return json({ ok: true, batch_id: batchId, message: `已儲存 ${keys.length} 處修改。` });
+  if (stmts.length) await env.DB.batch(stmts);
+  console.log("site content saved", me.email, source, keys.length, "changed", changed);
+  return json({ ok: true, batch_id: batchId, message: changed ? `已儲存 ${changed} 處修改。` : "內容與目前相同，沒有變更。" });
 }
 
 // 修改紀錄：依批次分組，最近的在前
@@ -2424,7 +2442,223 @@ async function renderSitemap(env) {
   });
 }
 
-async function renderHomepage(request, env) {
+
+// ===== 版面：區塊排序 / 隱藏 / 複製，以及文字、框框樣式 =====
+// HTML 裡用 data-box-list 標記一組可排序的區塊、data-box 標記每個框框。
+// 設定存在 site_content：layout.<組名>（排列）、style.<文字代碼>（文字樣式）、bstyle.<框框代碼>（框框樣式）。
+// 所有樣式值都經過白名單轉成 CSS，不接受任何自由輸入的 CSS 字串。
+
+const TEXT_COLORS = {
+  navy: "#0D045F", blue: "#0A0AA3", orange: "#FF7000", "orange-soft": "#ff9b4d",
+  ink: "#17172a", gray: "#68687a", white: "#ffffff", red: "#c62828"
+};
+const TEXT_SIZES = { xs: "0.8em", sm: "0.9em", lg: "1.2em", xl: "1.45em", xxl: "1.8em" };
+const BOX_SHADOWS = {
+  none: "none",
+  sm: "0 4px 12px rgba(13,4,95,.08)",
+  md: "0 12px 30px rgba(13,4,95,.12)",
+  lg: "0 24px 60px rgba(13,4,95,.18)"
+};
+const HEX_RE = /^#[0-9a-fA-F]{6}$/;
+const BOX_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+function parseJsonValue(v) {
+  if (v && typeof v === "object") return v;
+  try {
+    return JSON.parse(String(v));
+  } catch {
+    return null;
+  }
+}
+
+function intIn(v, min, max) {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= min && n <= max ? n : undefined;
+}
+
+function normalizeTextStyle(v) {
+  if (!v || typeof v !== "object") return null;
+  const out = {};
+  if (TEXT_SIZES[v.size]) out.size = v.size;
+  if (TEXT_COLORS[v.color]) out.color = v.color;
+  if (v.bold === true || v.bold === false) out.bold = v.bold;
+  if (v.italic === true) out.italic = true;
+  if (v.underline === true) out.underline = true;
+  if (["left", "center", "right"].includes(v.align)) out.align = v.align;
+  return Object.keys(out).length ? out : null;
+}
+
+function textStyleCss(st) {
+  const inner = [];
+  const block = [];
+  if (st.size) inner.push("font-size:" + TEXT_SIZES[st.size]);
+  if (st.color) inner.push("color:" + TEXT_COLORS[st.color]);
+  if (st.bold === true) inner.push("font-weight:800");
+  if (st.bold === false) inner.push("font-weight:400");
+  if (st.italic) inner.push("font-style:italic");
+  if (st.underline) inner.push("text-decoration:underline");
+  if (st.align) block.push("text-align:" + st.align);
+  return { inner: inner.join(";"), block: block.join(";") };
+}
+
+function normalizeBoxStyle(v) {
+  if (!v || typeof v !== "object") return null;
+  const out = {};
+  if (v.bg === "transparent" || HEX_RE.test(v.bg || "")) out.bg = v.bg;
+  if (HEX_RE.test(v.color || "")) out.color = v.color;
+  if (HEX_RE.test(v.borderColor || "")) out.borderColor = v.borderColor;
+  const bw = intIn(v.borderWidth, 0, 8);
+  if (bw !== undefined) out.borderWidth = bw;
+  const r = intIn(v.radius, 0, 48);
+  if (r !== undefined) out.radius = r;
+  if (BOX_SHADOWS[v.shadow]) out.shadow = v.shadow;
+  const p = intIn(v.padding, 0, 80);
+  if (p !== undefined) out.padding = p;
+  const m = intIn(v.marginY, 0, 80);
+  if (m !== undefined) out.marginY = m;
+  return Object.keys(out).length ? out : null;
+}
+
+function boxStyleCss(st) {
+  const css = [];
+  if (st.bg) css.push("background:" + st.bg);
+  if (st.color) css.push("color:" + st.color);
+  if (st.borderWidth !== undefined) css.push("border-width:" + st.borderWidth + "px", "border-style:solid");
+  if (st.borderColor) css.push("border-color:" + st.borderColor);
+  if (st.radius !== undefined) css.push("border-radius:" + st.radius + "px");
+  if (st.shadow) css.push("box-shadow:" + BOX_SHADOWS[st.shadow]);
+  if (st.padding !== undefined) css.push("padding:" + st.padding + "px");
+  if (st.marginY !== undefined) css.push("margin-top:" + st.marginY + "px", "margin-bottom:" + st.marginY + "px");
+  return css.join(";");
+}
+
+function normalizeLayout(v, list) {
+  if (!v || typeof v !== "object" || !BOX_ID_RE.test(list)) return null;
+  const cloneRe = new RegExp("^" + list + "-c[0-9]{1,3}$");
+  const order = Array.isArray(v.order) ? v.order.filter((x) => typeof x === "string" && BOX_ID_RE.test(x)).slice(0, 80) : [];
+  const hidden = Array.isArray(v.hidden) ? v.hidden.filter((x) => order.includes(x)).slice(0, 80) : [];
+  const clones = {};
+  let n = 0;
+  if (v.clones && typeof v.clones === "object") {
+    for (const [id, src] of Object.entries(v.clones)) {
+      if (n >= 30) break;
+      if (cloneRe.test(id) && typeof src === "string" && BOX_ID_RE.test(src) && order.includes(id)) {
+        clones[id] = src;
+        n++;
+      }
+    }
+  }
+  return { order: [...new Set(order)], hidden: [...new Set(hidden)], clones };
+}
+
+// ---- 簡易 HTML 標籤掃描（只用在 data-box-list 容器內，找出每個框框的完整範圍）----
+const LAYOUT_VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+
+function layoutTagRe() {
+  return /<!--[\s\S]*?-->|<(\/?)([a-zA-Z][a-zA-Z0-9-]*)((?:[^>"']|"[^"]*"|'[^']*')*)>/g;
+}
+
+function elementEnd(html, start) {
+  const re = layoutTagRe();
+  re.lastIndex = start;
+  let depth = 0;
+  let m;
+  while ((m = re.exec(html))) {
+    if (m[0].startsWith("<!--")) continue;
+    const name = m[2].toLowerCase();
+    if (m[1]) depth--;
+    else if (!LAYOUT_VOID.has(name) && !/\/\s*$/.test(m[3])) depth++;
+    if (depth === 0) return re.lastIndex;
+  }
+  return -1;
+}
+
+function childElements(html, from, to) {
+  const re = layoutTagRe();
+  const out = [];
+  re.lastIndex = from;
+  let m;
+  while ((m = re.exec(html)) && m.index < to) {
+    if (m[0].startsWith("<!--") || m[1]) continue;
+    const end = elementEnd(html, m.index);
+    if (end < 0 || end > to) break;
+    const id = (m[3].match(/\sdata-box="([^"]+)"/) || [])[1] || null;
+    out.push({ start: m.index, end, id });
+    re.lastIndex = end;
+  }
+  return out;
+}
+
+function cloneKey(key, n) {
+  return key.replace(/\.c[0-9]+$/, "") + ".c" + n;
+}
+
+function makeClone(html, cloneId, sourceId) {
+  const n = Number(cloneId.split("-c").pop());
+  return html
+    .replace(/\sid="[^"]*"/g, "")
+    .replace(/\sdata-box-source="[^"]*"/g, "")
+    .replace(/(data-edit(?:-img)?)="([^"]+)"/g, (all, attr, key) => attr + '="' + cloneKey(key, n) + '"')
+    .replace(/\sdata-box="[^"]*"/, ' data-box="' + cloneId + '" data-box-source="' + sourceId + '"');
+}
+
+function applyLayouts(html, content, editMode) {
+  for (const [key, row] of content) {
+    if (row.type !== "layout" || !key.startsWith("layout.")) continue;
+    const list = key.slice(7);
+    const layout = normalizeLayout(parseJsonValue(row.value), list);
+    if (!layout) continue;
+
+    const marker = html.indexOf('data-box-list="' + list + '"');
+    if (marker < 0) continue;
+    const open = html.lastIndexOf("<", marker);
+    const openEnd = html.indexOf(">", marker) + 1;
+    const end = elementEnd(html, open);
+    if (end < 0) continue;
+    const closeStart = html.lastIndexOf("</", end);
+
+    const kids = childElements(html, openEnd, closeStart).filter((k) => k.id);
+    if (!kids.length) continue;
+
+    const boxes = new Map(kids.map((k) => [k.id, html.slice(k.start, k.end)]));
+    const originalIds = kids.map((k) => k.id);
+
+    // 複製的框框（可能是複製品的複製品，所以重複解析直到沒有進展）
+    let pending = Object.entries(layout.clones);
+    for (let round = 0; round < 5 && pending.length; round++) {
+      pending = pending.filter(([id, src]) => {
+        if (!boxes.has(src)) return true;
+        boxes.set(id, makeClone(boxes.get(src), id, src));
+        return false;
+      });
+    }
+
+    const order = layout.order.filter((id) => boxes.has(id));
+    for (const id of originalIds) if (!order.includes(id)) order.push(id); // 網站之後新增的框框排在最後
+
+    const sep = kids.length > 1 ? html.slice(kids[0].end, kids[1].start) : "\n";
+    const parts = [];
+    for (const id of order) {
+      let box = boxes.get(id);
+      if (layout.hidden.includes(id)) {
+        if (!editMode) continue;
+        box = box.replace(/^<([a-zA-Z][a-zA-Z0-9-]*)/, '<$1 data-cms-hidden="1"');
+      }
+      parts.push(box);
+    }
+
+    html = html.slice(0, kids[0].start) + parts.join(sep) + html.slice(kids[kids.length - 1].end);
+  }
+  return html;
+}
+
+function mergeStyleAttr(el, css) {
+  if (!css) return;
+  const cur = (el.getAttribute("style") || "").trim();
+  el.setAttribute("style", (cur ? cur.replace(/;?$/, ";") : "") + css);
+}
+
+async function renderHomepage(request, env, editMode) {
   // 不帶快取條件去拿原始 HTML，避免 304 讓瀏覽器沿用舊內容
   const headers = new Headers(request.headers);
   headers.delete("If-None-Match");
@@ -2442,16 +2676,66 @@ async function renderHomepage(request, env) {
     return origin;
   }
 
+  // 有區塊排列設定時先在文字層處理（排序、隱藏、複製），再交給 HTMLRewriter 套內容與樣式
+  let source = origin;
+  const hasLayout = [...content.values()].some((r) => r.type === "layout");
+  if (hasLayout) {
+    const text = await origin.text();
+    let html = text;
+    try {
+      html = applyLayouts(text, content, editMode);
+    } catch (error) {
+      console.error("apply layout failed:", error);
+    }
+    source = new Response(html, { status: 200, headers: origin.headers });
+  }
+
   const get = (el, attr, type) => {
     const c = content.get(el.getAttribute(attr));
     return c && c.type === type ? c.value : null;
   };
 
+  const styleOf = (key, type, normalize) => {
+    const c = content.get(key);
+    return c && c.type === type ? normalize(parseJsonValue(c.value)) : null;
+  };
+
   const rewritten = new HTMLRewriter()
     .on("[data-edit]", {
       element(el) {
+        const key = el.getAttribute("data-edit");
         const v = get(el, "data-edit", "text");
-        if (v !== null) el.setInnerContent(v, { html: true });
+        const st = styleOf("style." + key, "tstyle", normalizeTextStyle);
+
+        if (!st) {
+          if (v !== null) el.setInnerContent(v, { html: true });
+          return;
+        }
+
+        const css = textStyleCss(st);
+        mergeStyleAttr(el, css.block);
+        if (editMode) el.setAttribute("data-cms-tstyle", JSON.stringify(st));
+
+        // 字級用內層 span 的 em，才會以這個元素原本的字級為基準等比放大縮小（手機版也一樣）
+        if (css.inner) {
+          const openTag = '<span class="cms-tx" style="' + css.inner + '">';
+          if (v !== null) {
+            el.setInnerContent(openTag + v + "</span>", { html: true });
+          } else {
+            el.prepend(openTag, { html: true });
+            el.append("</span>", { html: true });
+          }
+        } else if (v !== null) {
+          el.setInnerContent(v, { html: true });
+        }
+      }
+    })
+    .on("[data-box]", {
+      element(el) {
+        const st = styleOf("bstyle." + el.getAttribute("data-box"), "bstyle", normalizeBoxStyle);
+        if (!st) return;
+        mergeStyleAttr(el, boxStyleCss(st));
+        if (editMode) el.setAttribute("data-cms-bstyle", JSON.stringify(st));
       }
     })
     .on("[data-edit-img]", {
@@ -2478,12 +2762,13 @@ async function renderHomepage(request, env) {
         if (v !== null) el.setAttribute("content", v);
       }
     })
-    .transform(origin);
+    .transform(source);
 
   const out = new Response(rewritten.body, rewritten);
   out.headers.delete("ETag");
   out.headers.delete("Last-Modified");
-  out.headers.set("Cache-Control", "no-cache");
+  out.headers.delete("Content-Length");
+  out.headers.set("Cache-Control", editMode ? "private, no-store" : "no-cache");
   return out;
 }
 
@@ -3336,6 +3621,50 @@ th{
     border-color: #f08a24;
     background: #fff6ec;
   }
+  /* 浮動樣式面板：選取文字或框框時出現在左下角（側欄位置），可拖曳、可收合 */
+  .style-panel {
+    position: fixed;
+    left: 8px;
+    bottom: 8px;
+    width: 324px;
+    max-width: calc(100vw - 36px);
+    max-height: 78vh;
+    overflow: auto;
+    z-index: 60;
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 18px 50px rgba(13,4,95,.28);
+    padding: 12px 14px;
+    display: none;
+    gap: 10px;
+  }
+  .style-panel.show { display: grid; }
+  /* 面板出現時把左側欄加寬，面板放在側欄位置，不會擋到預覽畫面 */
+  .shell.style-open { grid-template-columns: 340px 1fr; }
+  .style-panel.collapsed .style-group, .style-panel.collapsed #styleHint { display: none; }
+  .style-head { display: flex; align-items: center; gap: 8px; cursor: move; user-select: none; }
+  .style-head strong { flex: 1; color: var(--blue); }
+  .style-panel #styleHint { font-size: 12px; }
+  .style-group { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+  .style-group.off { opacity: .45; pointer-events: none; }
+  .style-title { font-weight: 800; margin-bottom: 6px; }
+  .style-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin: 6px 0; }
+  .style-label { font-size: 13px; color: var(--muted); min-width: 36px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; background: #fff; padding: 5px 9px; cursor: pointer; font: inherit; font-size: 13px; border-right: 1px solid var(--line); }
+  .seg button:last-child { border-right: 0; }
+  .seg button.on { background: var(--blue); color: #fff; }
+  .swatches { display: inline-flex; gap: 5px; flex-wrap: wrap; }
+  .swatches button { width: 24px; height: 24px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px var(--line); cursor: pointer; padding: 0; font-size: 11px; }
+  .swatches button.on { box-shadow: 0 0 0 2px #FF7000; }
+  .chk { font-size: 13px; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+  .chk input { width: auto; margin: 0; }
+  .style-panel.dragging { opacity: .25; pointer-events: none; }
+  .btn.sm { padding: 5px 10px; font-size: 13px; }
+  .style-row input[type=range] { width: 150px; padding: 0; }
+  .style-row input[type=color] { width: 34px; height: 26px; padding: 0; border: 1px solid var(--line); border-radius: 6px; }
+  .style-row .val { font-size: 12px; color: var(--muted); min-width: 30px; }
+  #pageToolbarPanel { position: sticky; top: 0; z-index: 30; }
 </style>
 
 </head>
@@ -4372,10 +4701,10 @@ th{
     class="section"
   >
 
-    <div class="panel" style="padding:16px 20px">
+    <div class="panel" id="pageToolbarPanel" style="padding:16px 20px">
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
         <strong style="color:var(--blue)">首頁內容編輯</strong>
-        <span class="muted">點文字直接修改；點 Logo 或「更換背景圖」上傳新圖片。改完按「儲存」才會上線。</span>
+        <span class="muted">點文字直接修改；點 Logo 或「更換背景圖」上傳新圖片；框框上方有排序、複製、隱藏工具。改完按「儲存」才會上線。</span>
         <span style="flex:1"></span>
         <span id="pageDirty" class="badge">尚無修改</span>
         <button class="btn ghost" type="button" id="pageRevertKey" disabled>還原此區塊預設</button>
@@ -4383,6 +4712,98 @@ th{
         <button class="btn primary" type="button" id="pageSave">儲存並上線</button>
       </div>
       <div id="pageSelected" class="muted" style="margin-top:8px">尚未選取區塊</div>
+      <div id="stylePanel" class="style-panel">
+        <div class="style-head" id="styleHead">
+          <strong>樣式與框框</strong>
+          <button class="btn ghost sm" type="button" id="styleCollapse">收合</button>
+          <button class="btn ghost sm" type="button" id="styleClose">關閉</button>
+        </div>
+        <div class="style-group" id="textStyleGroup">
+          <div class="style-title">文字樣式 <span class="muted" id="textStyleTarget"></span></div>
+          <div class="style-row">
+            <span class="style-label">大小</span>
+            <div class="seg" id="tsSize">
+              <button type="button" data-v="xs">特小</button>
+              <button type="button" data-v="sm">小</button>
+              <button type="button" data-v="">標準</button>
+              <button type="button" data-v="lg">大</button>
+              <button type="button" data-v="xl">特大</button>
+              <button type="button" data-v="xxl">超大</button>
+            </div>
+          </div>
+          <div class="style-row">
+            <span class="style-label">顏色</span>
+            <div class="swatches" id="tsColor"></div>
+          </div>
+          <div class="style-row">
+            <span class="style-label">字型</span>
+            <div class="seg" id="tsBold">
+              <button type="button" data-v="">預設</button>
+              <button type="button" data-v="true"><b>粗</b></button>
+              <button type="button" data-v="false">細</button>
+            </div>
+            <label class="chk"><input type="checkbox" id="tsItalic"> <i>斜體</i></label>
+            <label class="chk"><input type="checkbox" id="tsUnderline"> <u>底線</u></label>
+          </div>
+          <div class="style-row">
+            <span class="style-label">對齊</span>
+            <div class="seg" id="tsAlign">
+              <button type="button" data-v="">預設</button>
+              <button type="button" data-v="left">靠左</button>
+              <button type="button" data-v="center">置中</button>
+              <button type="button" data-v="right">靠右</button>
+            </div>
+            <button class="btn ghost sm" type="button" id="tsClear">清除文字樣式</button>
+          </div>
+        </div>
+
+        <div class="style-group" id="boxStyleGroup">
+          <div class="style-title">框框 <span class="muted" id="boxStyleTarget"></span></div>
+          <div class="style-row">
+            <button class="btn ghost sm" type="button" id="boxUp">↑ 往前</button>
+            <button class="btn ghost sm" type="button" id="boxDown">↓ 往後</button>
+            <button class="btn ghost sm" type="button" id="boxClone">複製一個</button>
+            <button class="btn ghost sm" type="button" id="boxHide">隱藏</button>
+            <button class="btn danger sm" type="button" id="boxDelete">刪除</button>
+          </div>
+          <div class="style-row">
+            <span class="style-label">背景</span>
+            <input type="color" id="bsBg" data-prop="bg">
+            <button class="btn ghost sm" type="button" id="bsBgNone">透明</button>
+            <span class="style-label">文字色</span>
+            <input type="color" id="bsColor" data-prop="color">
+          </div>
+          <div class="style-row">
+            <span class="style-label">邊框</span>
+            <input type="range" min="0" max="8" id="bsBorderWidth" data-prop="borderWidth"><span class="val" data-val="borderWidth"></span>
+            <input type="color" id="bsBorderColor" data-prop="borderColor" title="邊框顏色">
+          </div>
+          <div class="style-row">
+            <span class="style-label">圓角</span>
+            <input type="range" min="0" max="48" id="bsRadius" data-prop="radius"><span class="val" data-val="radius"></span>
+          </div>
+          <div class="style-row">
+            <span class="style-label">內距</span>
+            <input type="range" min="0" max="80" id="bsPadding" data-prop="padding"><span class="val" data-val="padding"></span>
+          </div>
+          <div class="style-row">
+            <span class="style-label">外距</span>
+            <input type="range" min="0" max="80" id="bsMarginY" data-prop="marginY" title="上下外距"><span class="val" data-val="marginY"></span>
+          </div>
+          <div class="style-row">
+            <span class="style-label">陰影</span>
+            <div class="seg" id="bsShadow">
+              <button type="button" data-v="">預設</button>
+              <button type="button" data-v="none">無</button>
+              <button type="button" data-v="sm">淡</button>
+              <button type="button" data-v="md">中</button>
+              <button type="button" data-v="lg">深</button>
+            </div>
+            <button class="btn ghost sm" type="button" id="bsClear">清除框框樣式</button>
+          </div>
+        </div>
+        <div class="muted" id="styleHint">點文字可調整文字樣式；點框框的空白處（或文字所在的框框）可調整框框、排序、複製、隱藏。框框上方的「⠿」可以直接拖曳換位置。</div>
+      </div>
       <input type="file" id="pageImageInput" accept="image/jpeg,image/png,image/webp" style="display:none">
     </div>
 
@@ -5800,6 +6221,11 @@ function updatePageToolbar() {
 function loadPageFrame() {
   pageEditor.dirty = {};
   pageEditor.selectedKey = null;
+  pageEditor.selectedEl = null;
+  pageEditor.selectedBox = null;
+  pageEditor.hoverBox = null;
+  pageEditor.dragBox = null;
+  if (typeof updateStylePanel === "function") updateStylePanel();
   updatePageToolbar();
   var frame = document.getElementById("pageFrame");
   frame.onload = setupPageFrame;
@@ -5821,7 +6247,17 @@ function setupPageFrame() {
     "[data-edit].cms-dirty{box-shadow:0 0 0 4px rgba(255,112,0,.18)}" +
     "[data-edit-img]{cursor:pointer}" +
     "[data-edit-img]:hover{outline:2px dashed #FF7000;outline-offset:3px}" +
-    ".cms-bg-btn{position:absolute;top:84px;right:16px;z-index:50;background:#FF7000;color:#fff;border:0;border-radius:8px;padding:8px 12px;font-weight:800;cursor:pointer;box-shadow:0 6px 18px rgba(0,0,0,.25)}";
+    ".cms-bg-btn{position:absolute;top:84px;right:16px;z-index:50;background:#FF7000;color:#fff;border:0;border-radius:8px;padding:8px 12px;font-weight:800;cursor:pointer;box-shadow:0 6px 18px rgba(0,0,0,.25)}" +
+    "[data-box]:hover{outline:1px dashed rgba(10,10,163,.45);outline-offset:4px}" +
+    "[data-box].cms-box-selected{outline:2px solid #0A0AA3;outline-offset:4px}" +
+    "[data-cms-hidden]{opacity:.35!important;filter:grayscale(1)}" +
+    "[data-box].cms-dragging{opacity:.55;outline:2px dashed #FF7000!important}" +
+    "body.cms-drag-mode,body.cms-drag-mode *{cursor:grabbing!important;user-select:none!important}" +
+    "#cms-boxbar{position:absolute;z-index:2147483000;display:none;gap:2px;background:#0A0AA3;border-radius:8px;padding:3px;box-shadow:0 6px 18px rgba(0,0,0,.25);font:600 12px/1 system-ui,sans-serif}" +
+    "#cms-boxbar button{border:0;background:transparent;color:#fff;padding:6px 8px;border-radius:5px;cursor:pointer;font:inherit}" +
+    "#cms-boxbar button:hover{background:rgba(255,255,255,.18)}" +
+    "#cms-boxbar button[data-act=drag]{cursor:grab}" +
+    "#cms-boxbar button[data-act=delete]{color:#ffb4b4}";
   doc.head.appendChild(style);
 
   doc.querySelectorAll("[data-edit-bg]").forEach(function(sec) {
@@ -5850,13 +6286,22 @@ function setupPageFrame() {
     }
 
     var el = e.target.closest("[data-edit]");
-    if (!el) return;
+    if (!el) {
+      if (e.target.closest("#cms-boxbar")) return;
+      var box = e.target.closest("[data-box]");
+      if (box) {
+        e.preventDefault();
+        selectBox(box);
+      }
+      return;
+    }
     e.preventDefault();
     activatePageText(el);
   }, true);
 
   doc.addEventListener("submit", function(e) { e.preventDefault(); }, true);
 
+  setupLayoutEditing(doc);
   fillSeoForm(doc);
 }
 
@@ -5872,6 +6317,8 @@ function activatePageText(el) {
   el.focus();
 
   pageEditor.selectedKey = el.getAttribute("data-edit");
+  pageEditor.selectedEl = el;
+  selectBox(el.closest("[data-box]"));
   updatePageToolbar();
 
   if (!el.dataset.cmsBound) {
@@ -5891,7 +6338,7 @@ function activatePageText(el) {
     });
 
     el.addEventListener("input", function() {
-      pageEditor.dirty[el.getAttribute("data-edit")] = { type: "text", value: el.innerHTML };
+      pageEditor.dirty[el.getAttribute("data-edit")] = { type: "text", value: textTarget(el).innerHTML };
       el.classList.add("cms-dirty");
       updatePageToolbar();
     });
@@ -5952,6 +6399,576 @@ document.getElementById("pageImageInput").addEventListener("change", async funct
     flash(err.message, false);
   }
 });
+
+// ===== 版面與樣式（文字大小顏色、框框樣式、排序、複製、隱藏）=====
+
+var TS_SIZES = { xs: "0.8em", sm: "0.9em", lg: "1.2em", xl: "1.45em", xxl: "1.8em" };
+var TS_COLORS = [
+  ["", "預設", "linear-gradient(135deg,#fff 45%,#d33 46%,#d33 54%,#fff 55%)"],
+  ["navy", "深藍", "#0D045F"],
+  ["blue", "藍", "#0A0AA3"],
+  ["orange", "橘", "#FF7000"],
+  ["orange-soft", "淺橘", "#ff9b4d"],
+  ["ink", "黑", "#17172a"],
+  ["gray", "灰", "#68687a"],
+  ["white", "白", "#ffffff"],
+  ["red", "紅", "#c62828"]
+];
+var TS_COLOR_HEX = {};
+TS_COLORS.forEach(function(c) { if (c[0]) TS_COLOR_HEX[c[0]] = c[2]; });
+var BS_SHADOWS = {
+  none: "none",
+  sm: "0 4px 12px rgba(13,4,95,.08)",
+  md: "0 12px 30px rgba(13,4,95,.12)",
+  lg: "0 24px 60px rgba(13,4,95,.18)"
+};
+var LIST_LABELS = {
+  "hero-stats": "首頁亮點", focus: "公司重點", points: "簡介重點", services: "服務項目", why: "選擇我們",
+  partners: "合作夥伴", investors: "投資人專區", steps: "合作流程", cta: "聯絡步驟"
+};
+
+function readJsonAttr(el, attr) {
+  try {
+    return JSON.parse(el.getAttribute(attr) || "{}") || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function compactStyle(st) {
+  var out = {};
+  Object.keys(st).forEach(function(k) {
+    if (st[k] !== undefined && st[k] !== null && st[k] !== "") out[k] = st[k];
+  });
+  return out;
+}
+
+// 文字實際的編輯目標：有樣式時內容包在 span.cms-tx 裡
+function textTarget(el) {
+  var w = el.firstElementChild;
+  if (w && w.classList.contains("cms-tx") && el.childNodes.length === 1) return w;
+  return el;
+}
+
+function ensureTextWrap(el) {
+  var t = textTarget(el);
+  if (t !== el) return t;
+  var w = el.ownerDocument.createElement("span");
+  w.className = "cms-tx";
+  while (el.firstChild) w.appendChild(el.firstChild);
+  el.appendChild(w);
+  return w;
+}
+
+function textCss(st) {
+  var css = [];
+  if (st.size) css.push("font-size:" + TS_SIZES[st.size]);
+  if (st.color) css.push("color:" + TS_COLOR_HEX[st.color]);
+  if (st.bold === true) css.push("font-weight:800");
+  if (st.bold === false) css.push("font-weight:400");
+  if (st.italic) css.push("font-style:italic");
+  if (st.underline) css.push("text-decoration:underline");
+  return css.join(";");
+}
+
+function setTextStyle(el, st) {
+  st = compactStyle(st);
+  var key = el.getAttribute("data-edit");
+  pageEditor.dirty["style." + key] = Object.keys(st).length ? { type: "tstyle", value: st } : null;
+  el.setAttribute("data-cms-tstyle", JSON.stringify(st));
+  var css = textCss(st);
+  if (css) ensureTextWrap(el).style.cssText = css;
+  else if (textTarget(el) !== el) textTarget(el).style.cssText = "";
+  el.style.textAlign = st.align || "";
+  el.classList.add("cms-dirty");
+  updatePageToolbar();
+  updateStylePanel();
+  positionBoxBar();
+}
+
+function boxCss(st) {
+  var css = [];
+  if (st.bg) css.push("background:" + st.bg);
+  if (st.color) css.push("color:" + st.color);
+  if (st.borderWidth !== undefined) css.push("border-width:" + st.borderWidth + "px", "border-style:solid");
+  if (st.borderColor) css.push("border-color:" + st.borderColor);
+  if (st.radius !== undefined) css.push("border-radius:" + st.radius + "px");
+  if (st.shadow) css.push("box-shadow:" + BS_SHADOWS[st.shadow]);
+  if (st.padding !== undefined) css.push("padding:" + st.padding + "px");
+  if (st.marginY !== undefined) css.push("margin-top:" + st.marginY + "px", "margin-bottom:" + st.marginY + "px");
+  return css.join(";");
+}
+
+function setBoxStyle(box, st) {
+  st = compactStyle(st);
+  var id = box.getAttribute("data-box");
+  pageEditor.dirty["bstyle." + id] = Object.keys(st).length ? { type: "bstyle", value: st } : null;
+  box.setAttribute("data-cms-bstyle", JSON.stringify(st));
+  box.style.cssText = boxCss(st);
+  updatePageToolbar();
+  updateStylePanel();
+  positionBoxBar();
+}
+
+// ---- 框框排列 ----
+
+function boxContainer(box) {
+  var p = box && box.parentElement;
+  return p && p.hasAttribute("data-box-list") ? p : null;
+}
+
+function boxesIn(container) {
+  return Array.prototype.filter.call(container.children, function(c) { return c.hasAttribute("data-box"); });
+}
+
+function markLayout(container) {
+  var list = container.getAttribute("data-box-list");
+  var boxes = boxesIn(container);
+  var clones = {};
+  boxes.forEach(function(b) {
+    if (b.getAttribute("data-box-source")) clones[b.getAttribute("data-box")] = b.getAttribute("data-box-source");
+  });
+  pageEditor.dirty["layout." + list] = {
+    type: "layout",
+    value: {
+      order: boxes.map(function(b) { return b.getAttribute("data-box"); }),
+      hidden: boxes.filter(function(b) { return b.hasAttribute("data-cms-hidden"); }).map(function(b) { return b.getAttribute("data-box"); }),
+      clones: clones
+    }
+  };
+  updatePageToolbar();
+  updateStylePanel();
+  positionBoxBar();
+}
+
+function moveBox(box, dir) {
+  var c = boxContainer(box);
+  if (!c) return;
+  var boxes = boxesIn(c);
+  var i = boxes.indexOf(box);
+  var j = i + dir;
+  if (j < 0 || j >= boxes.length) return;
+  if (dir < 0) c.insertBefore(box, boxes[j]);
+  else c.insertBefore(box, boxes[j].nextSibling);
+  markLayout(c);
+}
+
+function baseKey(k) {
+  var i = k.search(/[.]c[0-9]+$/);
+  return i >= 0 ? k.slice(0, i) : k;
+}
+
+function cleanEditorMarks(root) {
+  var all = [root].concat(Array.prototype.slice.call(root.querySelectorAll("*")));
+  all.forEach(function(n) {
+    n.classList.remove("cms-active", "cms-dirty", "cms-box-selected", "cms-dragging");
+    n.removeAttribute("contenteditable");
+    n.removeAttribute("data-cms-bound");
+    n.removeAttribute("id");
+  });
+}
+
+function cloneBox(box) {
+  var c = boxContainer(box);
+  if (!c) return;
+  var list = c.getAttribute("data-box-list");
+  var max = 0;
+  c.ownerDocument.querySelectorAll('[data-box^="' + list + '-c"]').forEach(function(b) {
+    var n = Number(b.getAttribute("data-box").slice(list.length + 2));
+    if (n > max) max = n;
+  });
+  if (max >= 30) {
+    flash("同一組最多複製 30 個。", false);
+    return;
+  }
+  var n = max + 1;
+  var id = list + "-c" + n;
+  var copy = box.cloneNode(true);
+  cleanEditorMarks(copy);
+  copy.removeAttribute("data-cms-hidden");
+  copy.setAttribute("data-box", id);
+  copy.setAttribute("data-box-source", box.getAttribute("data-box"));
+
+  copy.querySelectorAll("[data-edit]").forEach(function(el) {
+    var k = baseKey(el.getAttribute("data-edit")) + ".c" + n;
+    el.setAttribute("data-edit", k);
+    pageEditor.dirty[k] = { type: "text", value: textTarget(el).innerHTML };
+    var st = readJsonAttr(el, "data-cms-tstyle");
+    if (Object.keys(st).length) pageEditor.dirty["style." + k] = { type: "tstyle", value: st };
+  });
+  copy.querySelectorAll("[data-edit-img]").forEach(function(el) {
+    var k = baseKey(el.getAttribute("data-edit-img")) + ".c" + n;
+    el.setAttribute("data-edit-img", k);
+    var src = el.getAttribute("src") || "";
+    if (src.indexOf("/media/") === 0) pageEditor.dirty[k] = { type: "image", value: src };
+  });
+  var bst = readJsonAttr(box, "data-cms-bstyle");
+  if (Object.keys(bst).length) pageEditor.dirty["bstyle." + id] = { type: "bstyle", value: bst };
+
+  box.parentNode.insertBefore(copy, box.nextSibling);
+  markLayout(c);
+  selectBox(copy);
+  flash("已複製，點新框框裡的文字就能修改。");
+}
+
+function toggleHideBox(box) {
+  var c = boxContainer(box);
+  if (!c) return;
+  if (box.hasAttribute("data-cms-hidden")) box.removeAttribute("data-cms-hidden");
+  else box.setAttribute("data-cms-hidden", "1");
+  markLayout(c);
+}
+
+function deleteBox(box) {
+  var c = boxContainer(box);
+  if (!c || !box.getAttribute("data-box-source")) return;
+  if (!confirm("刪除這個複製出來的框框？（按儲存後生效）")) return;
+  box.querySelectorAll("[data-edit]").forEach(function(el) {
+    var k = el.getAttribute("data-edit");
+    pageEditor.dirty[k] = null;
+    pageEditor.dirty["style." + k] = null;
+  });
+  box.querySelectorAll("[data-edit-img]").forEach(function(el) {
+    pageEditor.dirty[el.getAttribute("data-edit-img")] = null;
+  });
+  pageEditor.dirty["bstyle." + box.getAttribute("data-box")] = null;
+  if (pageEditor.selectedEl && box.contains(pageEditor.selectedEl)) pageEditor.selectedEl = null;
+  box.remove();
+  pageEditor.selectedBox = null;
+  markLayout(c);
+}
+
+// ---- 選取 ----
+
+function selectBox(box) {
+  var doc = document.getElementById("pageFrame").contentDocument;
+  if (doc) doc.querySelectorAll(".cms-box-selected").forEach(function(x) { x.classList.remove("cms-box-selected"); });
+  pageEditor.selectedBox = box || null;
+  if (box) box.classList.add("cms-box-selected");
+  updateStylePanel();
+  positionBoxBar();
+}
+
+function boxName(box) {
+  var c = boxContainer(box);
+  var id = box.getAttribute("data-box");
+  if (!c) return id;
+  var list = c.getAttribute("data-box-list");
+  var idx = boxesIn(c).indexOf(box) + 1;
+  return (LIST_LABELS[list] || list) + " 第 " + idx + " 個" + (box.getAttribute("data-box-source") ? "（複製）" : "") +
+    (box.hasAttribute("data-cms-hidden") ? "（已隱藏）" : "");
+}
+
+// ---- 框框上方的小工具列（在預覽畫面裡）----
+
+function positionBoxBar() {
+  var frame = document.getElementById("pageFrame");
+  var doc = frame.contentDocument;
+  if (!doc) return;
+  var bar = doc.getElementById("cms-boxbar");
+  if (!bar) return;
+  var box = pageEditor.hoverBox || pageEditor.selectedBox;
+  if (!box || !box.isConnected) {
+    bar.style.display = "none";
+    return;
+  }
+  var win = frame.contentWindow;
+  var r = box.getBoundingClientRect();
+  var inList = !!boxContainer(box);
+  bar.querySelector('[data-act="drag"]').style.display = inList ? "" : "none";
+  bar.querySelector('[data-act="up"]').style.display = inList ? "" : "none";
+  bar.querySelector('[data-act="down"]').style.display = inList ? "" : "none";
+  bar.querySelector('[data-act="clone"]').style.display = inList ? "" : "none";
+  bar.querySelector('[data-act="hide"]').style.display = inList ? "" : "none";
+  bar.querySelector('[data-act="hide"]').textContent = box.hasAttribute("data-cms-hidden") ? "顯示" : "隱藏";
+  bar.querySelector('[data-act="delete"]').style.display = box.getAttribute("data-box-source") ? "" : "none";
+  bar.style.display = "flex";
+  var top = r.top + win.scrollY - 34;
+  if (r.top < 40) top = r.top + win.scrollY + 4;
+  bar.style.top = top + "px";
+  bar.style.left = Math.max(4, r.left + win.scrollX) + "px";
+}
+
+function setupLayoutEditing(doc) {
+  var win = doc.defaultView;
+
+  var bar = doc.createElement("div");
+  bar.id = "cms-boxbar";
+  bar.innerHTML =
+    '<button type="button" data-act="drag" title="按住拖曳換位置">⠿ 拖曳</button>' +
+    '<button type="button" data-act="up" title="往前">↑</button>' +
+    '<button type="button" data-act="down" title="往後">↓</button>' +
+    '<button type="button" data-act="clone">複製</button>' +
+    '<button type="button" data-act="hide">隱藏</button>' +
+    '<button type="button" data-act="delete">刪除</button>' +
+    '<button type="button" data-act="style">樣式</button>';
+  doc.body.appendChild(bar);
+
+  bar.addEventListener("mouseenter", function() { pageEditor.overBar = true; });
+  bar.addEventListener("mouseleave", function() { pageEditor.overBar = false; });
+
+  bar.addEventListener("click", function(e) {
+    var b = e.target.closest("button");
+    if (!b) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var box = pageEditor.hoverBox || pageEditor.selectedBox;
+    if (!box) return;
+    var act = b.getAttribute("data-act");
+    if (act === "up") moveBox(box, -1);
+    if (act === "down") moveBox(box, 1);
+    if (act === "clone") cloneBox(box);
+    if (act === "hide") toggleHideBox(box);
+    if (act === "delete") deleteBox(box);
+    if (act === "style") {
+      selectBox(box);
+      document.getElementById("pageToolbarPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, true);
+
+  doc.addEventListener("mouseover", function(e) {
+    if (pageEditor.dragBox || pageEditor.overBar) return;
+    if (e.target.closest && e.target.closest("#cms-boxbar")) return;
+    var box = e.target.closest ? e.target.closest("[data-box]") : null;
+    if (box !== pageEditor.hoverBox) {
+      pageEditor.hoverBox = box;
+      positionBoxBar();
+    }
+  });
+
+  win.addEventListener("scroll", positionBoxBar, { passive: true });
+  win.addEventListener("resize", positionBoxBar);
+
+  // 拖曳排序：按住「⠿ 拖曳」移動滑鼠，放開即完成
+  bar.querySelector('[data-act="drag"]').addEventListener("mousedown", function(e) {
+    var box = pageEditor.hoverBox || pageEditor.selectedBox;
+    if (!box || !boxContainer(box)) return;
+    e.preventDefault();
+    pageEditor.dragBox = box;
+    box.classList.add("cms-dragging");
+    doc.body.classList.add("cms-drag-mode");
+    document.getElementById("stylePanel").classList.add("dragging");
+  });
+
+  // 拖曳到預覽畫面上下邊緣時自動捲動
+  var edgeTimer = null;
+  var edgeDir = 0;
+  function edgeScroll() {
+    if (!pageEditor.dragBox || !edgeDir) {
+      clearInterval(edgeTimer);
+      edgeTimer = null;
+      return;
+    }
+    win.scrollBy(0, edgeDir * 18);
+  }
+
+  doc.addEventListener("mousemove", function(e) {
+    var box = pageEditor.dragBox;
+    if (!box) return;
+    e.preventDefault();
+    edgeDir = e.clientY < 70 ? -1 : (e.clientY > win.innerHeight - 70 ? 1 : 0);
+    if (edgeDir && !edgeTimer) edgeTimer = setInterval(edgeScroll, 30);
+    bar.style.display = "none";
+    var under = doc.elementFromPoint(e.clientX, e.clientY);
+    var target = under && under.closest ? under.closest("[data-box]") : null;
+    while (target && target.parentElement !== box.parentElement) {
+      target = target.parentElement ? target.parentElement.closest("[data-box]") : null;
+    }
+    if (!target || target === box) return;
+    var r = target.getBoundingClientRect();
+    var sibs = boxesIn(box.parentElement);
+    var horizontal = sibs.length > 1 && Math.abs(sibs[0].getBoundingClientRect().top - sibs[1].getBoundingClientRect().top) < 8;
+    var after = horizontal ? (e.clientX > r.left + r.width / 2) : (e.clientY > r.top + r.height / 2);
+    box.parentElement.insertBefore(box, after ? target.nextSibling : target);
+  });
+
+  function endDrag() {
+    var box = pageEditor.dragBox;
+    if (!box) return;
+    pageEditor.dragBox = null;
+    box.classList.remove("cms-dragging");
+    doc.body.classList.remove("cms-drag-mode");
+    document.getElementById("stylePanel").classList.remove("dragging");
+    markLayout(box.parentElement);
+    selectBox(box);
+  }
+  doc.addEventListener("mouseup", endDrag);
+  // 滑鼠移出預覽畫面才放開時也要結束拖曳
+  window.addEventListener("mouseup", endDrag);
+}
+
+// ---- 上方樣式面板 ----
+
+function setSeg(id, value) {
+  document.querySelectorAll("#" + id + " button").forEach(function(b) {
+    b.classList.toggle("on", b.getAttribute("data-v") === (value === undefined ? "" : String(value)));
+  });
+}
+
+function rgbToHex(c) {
+  var m = String(c || "").match(/[0-9.]+/g);
+  if (!m || m.length < 3) return "#ffffff";
+  return "#" + m.slice(0, 3).map(function(x) { var h = Math.round(Number(x)).toString(16); return h.length < 2 ? "0" + h : h; }).join("");
+}
+
+function updateStylePanel() {
+  var el = pageEditor.selectedEl && pageEditor.selectedEl.isConnected ? pageEditor.selectedEl : null;
+  var box = pageEditor.selectedBox && pageEditor.selectedBox.isConnected ? pageEditor.selectedBox : null;
+
+  var panel = document.getElementById("stylePanel");
+  var onPages = document.getElementById("pages").classList.contains("active");
+  var show = onPages && !!(el || box);
+  if (panel.classList.contains("show") !== show) {
+    panel.classList.toggle("show", show);
+    var shell = document.querySelector(".shell");
+    if (shell) shell.classList.toggle("style-open", show && !panel.style.top);
+    setTimeout(positionBoxBar, 50);
+  }
+
+  document.getElementById("textStyleGroup").classList.toggle("off", !el);
+  document.getElementById("textStyleTarget").textContent = el ? el.getAttribute("data-edit") : "（先點選一段文字）";
+  var ts = el ? readJsonAttr(el, "data-cms-tstyle") : {};
+  setSeg("tsSize", ts.size);
+  setSeg("tsBold", ts.bold);
+  setSeg("tsAlign", ts.align);
+  document.getElementById("tsItalic").checked = !!ts.italic;
+  document.getElementById("tsUnderline").checked = !!ts.underline;
+  document.querySelectorAll("#tsColor button").forEach(function(b) {
+    b.classList.toggle("on", b.getAttribute("data-v") === (ts.color || ""));
+  });
+
+  document.getElementById("boxStyleGroup").classList.toggle("off", !box);
+  document.getElementById("boxStyleTarget").textContent = box ? boxName(box) : "（先點選一個框框）";
+  var bs = box ? readJsonAttr(box, "data-cms-bstyle") : {};
+  var cs = box ? box.ownerDocument.defaultView.getComputedStyle(box) : null;
+  var inList = !!(box && boxContainer(box));
+  document.getElementById("boxUp").disabled = !inList;
+  document.getElementById("boxDown").disabled = !inList;
+  document.getElementById("boxClone").disabled = !inList;
+  document.getElementById("boxHide").disabled = !inList;
+  document.getElementById("boxHide").textContent = box && box.hasAttribute("data-cms-hidden") ? "取消隱藏" : "隱藏";
+  document.getElementById("boxDelete").disabled = !(box && box.getAttribute("data-box-source"));
+
+  document.getElementById("bsBg").value = bs.bg && bs.bg !== "transparent" ? bs.bg : rgbToHex(cs && cs.backgroundColor);
+  document.getElementById("bsColor").value = bs.color || rgbToHex(cs && cs.color);
+  document.getElementById("bsBorderColor").value = bs.borderColor || rgbToHex(cs && cs.borderTopColor);
+  [["bsBorderWidth", "borderWidth", "borderTopWidth"], ["bsRadius", "radius", "borderTopLeftRadius"],
+   ["bsPadding", "padding", "paddingTop"], ["bsMarginY", "marginY", "marginTop"]].forEach(function(x) {
+    var input = document.getElementById(x[0]);
+    var v = bs[x[1]];
+    input.value = v !== undefined ? v : Math.min(Number(input.max), parseInt(cs ? cs[x[2]] : 0, 10) || 0);
+    document.querySelector('[data-val="' + x[1] + '"]').textContent = v !== undefined ? v + "px" : "預設";
+  });
+  setSeg("bsShadow", bs.shadow);
+}
+
+function updateSelectedText(patch) {
+  var el = pageEditor.selectedEl;
+  if (!el) return;
+  var st = readJsonAttr(el, "data-cms-tstyle");
+  Object.keys(patch).forEach(function(k) { st[k] = patch[k]; });
+  setTextStyle(el, st);
+}
+
+function updateSelectedBox(patch) {
+  var box = pageEditor.selectedBox;
+  if (!box) return;
+  var st = readJsonAttr(box, "data-cms-bstyle");
+  Object.keys(patch).forEach(function(k) { st[k] = patch[k]; });
+  setBoxStyle(box, st);
+}
+
+(function initStylePanel() {
+  var sw = document.getElementById("tsColor");
+  sw.innerHTML = TS_COLORS.map(function(c) {
+    return '<button type="button" data-v="' + c[0] + '" title="' + c[1] + '" style="background:' + c[2] + '"></button>';
+  }).join("");
+  sw.addEventListener("click", function(e) {
+    var b = e.target.closest("button");
+    if (b) updateSelectedText({ color: b.getAttribute("data-v") || undefined });
+  });
+
+  function segHandler(id, apply, parse) {
+    document.getElementById(id).addEventListener("click", function(e) {
+      var b = e.target.closest("button");
+      if (!b) return;
+      var v = b.getAttribute("data-v");
+      apply(v === "" ? undefined : (parse ? parse(v) : v));
+    });
+  }
+  segHandler("tsSize", function(v) { updateSelectedText({ size: v }); });
+  segHandler("tsBold", function(v) { updateSelectedText({ bold: v }); }, function(v) { return v === "true"; });
+  segHandler("tsAlign", function(v) { updateSelectedText({ align: v }); });
+  segHandler("bsShadow", function(v) { updateSelectedBox({ shadow: v }); });
+
+  document.getElementById("tsItalic").addEventListener("change", function() { updateSelectedText({ italic: this.checked || undefined }); });
+  document.getElementById("tsUnderline").addEventListener("change", function() { updateSelectedText({ underline: this.checked || undefined }); });
+  document.getElementById("tsClear").addEventListener("click", function() { if (pageEditor.selectedEl) setTextStyle(pageEditor.selectedEl, {}); });
+
+  ["bsBg", "bsColor", "bsBorderColor"].forEach(function(id) {
+    document.getElementById(id).addEventListener("input", function() {
+      var p = {};
+      p[this.getAttribute("data-prop")] = this.value;
+      updateSelectedBox(p);
+    });
+  });
+  ["bsBorderWidth", "bsRadius", "bsPadding", "bsMarginY"].forEach(function(id) {
+    document.getElementById(id).addEventListener("input", function() {
+      var p = {};
+      p[this.getAttribute("data-prop")] = Number(this.value);
+      updateSelectedBox(p);
+    });
+  });
+  document.getElementById("bsBgNone").addEventListener("click", function() { updateSelectedBox({ bg: "transparent" }); });
+  document.getElementById("bsClear").addEventListener("click", function() { if (pageEditor.selectedBox) setBoxStyle(pageEditor.selectedBox, {}); });
+
+  document.getElementById("boxUp").addEventListener("click", function() { if (pageEditor.selectedBox) moveBox(pageEditor.selectedBox, -1); });
+  document.getElementById("boxDown").addEventListener("click", function() { if (pageEditor.selectedBox) moveBox(pageEditor.selectedBox, 1); });
+  document.getElementById("boxClone").addEventListener("click", function() { if (pageEditor.selectedBox) cloneBox(pageEditor.selectedBox); });
+  document.getElementById("boxHide").addEventListener("click", function() { if (pageEditor.selectedBox) toggleHideBox(pageEditor.selectedBox); });
+  document.getElementById("boxDelete").addEventListener("click", function() { if (pageEditor.selectedBox) deleteBox(pageEditor.selectedBox); });
+
+  document.getElementById("styleCollapse").addEventListener("click", function() {
+    var p = document.getElementById("stylePanel");
+    p.classList.toggle("collapsed");
+    this.textContent = p.classList.contains("collapsed") ? "展開" : "收合";
+  });
+  document.getElementById("styleClose").addEventListener("click", function() {
+    var doc = document.getElementById("pageFrame").contentDocument;
+    if (doc) doc.querySelectorAll(".cms-active").forEach(function(x) { x.classList.remove("cms-active"); x.removeAttribute("contenteditable"); });
+    pageEditor.selectedEl = null;
+    selectBox(null);
+  });
+
+  // 面板可以拖到別的位置，避免擋住要改的地方
+  var head = document.getElementById("styleHead");
+  head.addEventListener("mousedown", function(e) {
+    if (e.target.closest("button")) return;
+    var p = document.getElementById("stylePanel");
+    var r = p.getBoundingClientRect();
+    var dx = e.clientX - r.left, dy = e.clientY - r.top;
+    function move(ev) {
+      p.style.left = Math.max(0, Math.min(window.innerWidth - r.width, ev.clientX - dx)) + "px";
+      p.style.top = Math.max(0, Math.min(window.innerHeight - 60, ev.clientY - dy)) + "px";
+      p.style.bottom = "auto";
+    }
+    function up() {
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+    }
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+    e.preventDefault();
+  });
+
+  // 切換到其他後台頁面時隱藏面板
+  document.querySelectorAll(".nav button[data-target]").forEach(function(b) {
+    b.addEventListener("click", function() { setTimeout(updateStylePanel, 0); });
+  });
+
+  updateStylePanel();
+})();
+
 
 document.getElementById("pageSave").addEventListener("click", async function() {
   if (!pageDirtyCount()) return;
@@ -6379,6 +7396,15 @@ function historyValue(type, value) {
   if (type === "image") {
     return '<img src="' + escAttr(value) + '" style="max-width:160px;max-height:90px;border-radius:6px;border:1px solid var(--line)">';
   }
+  if (type === "layout") {
+    try {
+      var l = JSON.parse(value);
+      return esc("共 " + l.order.length + " 個，隱藏 " + l.hidden.length + " 個，複製 " + Object.keys(l.clones || {}).length + " 個");
+    } catch (e) {
+      return esc(value);
+    }
+  }
+  if (type === "tstyle" || type === "bstyle") return '<code style="font-size:12px">' + esc(value) + "</code>";
   var t = stripTags(value);
   return esc(t.length > 120 ? t.slice(0, 120) + "…" : t);
 }
@@ -6392,6 +7418,9 @@ function historyKeyLabel(key) {
   if (key === "hero.bg") return "首頁大圖";
   if (key === "contact.bg") return "聯絡區背景";
   if (key === "header.img-01") return "Logo";
+  if (key.indexOf("layout.") === 0) return "框框排列：" + (LIST_LABELS[key.slice(7)] || key.slice(7));
+  if (key.indexOf("style.") === 0) return "文字樣式：" + key.slice(6);
+  if (key.indexOf("bstyle.") === 0) return "框框樣式：" + key.slice(7);
   return key;
 }
 
